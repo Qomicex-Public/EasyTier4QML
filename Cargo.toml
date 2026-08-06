@@ -10,7 +10,7 @@ members = [
     "easytier-contrib/easytier-uptime",
     "easytier-contrib/easytier-android-jni",
 ]
-default-members = ["easytier", "easytier-web"]
+default-members = ["easytier"]
 exclude = [
     "easytier-contrib/easytier-ohrs", # it needs ohrs sdk
 ]
