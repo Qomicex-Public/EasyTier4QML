@@ -30,8 +30,14 @@ jobs:
           - os: ubuntu-latest
             NAME: linux-x86_64
             SUFFIX: ''
+          - os: ubuntu-24.04-arm
+            NAME: linux-arm64
+            SUFFIX: ''
           - os: macos-latest
             NAME: macos-arm64
+            SUFFIX: ''
+          - os: macos-15-intel
+            NAME: macos-x86_64
             SUFFIX: ''
     runs-on: ${{ matrix.os }}
     steps:
