@@ -1,0 +1,175 @@
+name: ET4QML Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.1.0). Leave empty to only build artifacts.'
+        required: false
+        default: ''
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-cli-core:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            NAME: windows-x86_64
+            SUFFIX: .exe
+          - os: ubuntu-latest
+            NAME: linux-x86_64
+            SUFFIX: ''
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: aripalo/setup-protoc@v2
+        with:
+          version: "25.1"
+
+      - name: Install LLVM (windows)
+        if: runner.os == 'Windows'
+        run: choco install llvm -y
+
+      - name: Install LLVM (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y llvm libclang-dev
+
+      - name: Set LLVM path
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "et4qml"
+
+      - name: Build easytier-core + easytier-cli
+        run: cargo build --release --package easytier --bins
+
+      - name: Build easytier-android-jni (rlib + cdylib)
+        run: cargo build --release -p easytier-android-jni --lib
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p ./artifacts
+          cp ./target/release/easytier-core${{ matrix.SUFFIX }} ./artifacts/
+          cp ./target/release/easytier-cli${{ matrix.SUFFIX }} ./artifacts/
+          cp ./target/release/libeasytier_android_jni.rlib ./artifacts/
+          if [[ -f ./target/release/easytier_android_jni.dll ]]; then
+            cp ./target/release/easytier_android_jni.dll ./artifacts/
+          fi
+          if [[ -f ./target/release/libeasytier_android_jni.so ]]; then
+            cp ./target/release/libeasytier_android_jni.so ./artifacts/
+          fi
+          ls -l ./artifacts
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: et4qml-${{ matrix.NAME }}
+          path: ./artifacts/*
+
+  build-android:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - TARGET: aarch64-linux-android
+            ARCH: aarch64
+          - TARGET: armv7-linux-androideabi
+            ARCH: armv7
+          - TARGET: i686-linux-android
+            ARCH: i686
+          - TARGET: x86_64-linux-android
+            ARCH: x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'oracle'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 12.0
+          packages: 'build-tools;34.0.0 ndk;26.0.10792818 platform-tools platforms;android-34'
+
+      - name: Setup Android Environment
+        run: |
+          echo "NDK_HOME=$ANDROID_HOME/ndk/26.0.10792818/" >> $GITHUB_ENV
+          echo "$ANDROID_HOME/ndk/26.0.10792818/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      - uses: aripalo/setup-protoc@v2
+        with:
+          version: "25.1"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.TARGET }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "et4qml-android"
+
+      - name: Build android-jni .so
+        run: cargo build --release --target ${{ matrix.TARGET }} -p easytier-android-jni --lib
+
+      - name: Collect artifact
+        shell: bash
+        run: |
+          mkdir -p ./artifacts
+          cp ./target/${{ matrix.TARGET }}/release/libeasytier_android_jni.so ./artifacts/
+          cp ./target/${{ matrix.TARGET }}/release/libeasytier_android_jni.rlib ./artifacts/
+          ls -l ./artifacts
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: et4qml-android-${{ matrix.ARCH }}
+          path: ./artifacts/*
+
+  release:
+    needs: [build-cli-core, build-android]
+    if: startsWith(github.ref, 'refs/tags/') || inputs.version != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: ./release_assets
+          merge-multiple: true
+
+      - name: Zip release assets
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version || github.ref_name }}"
+          mkdir -p ./zipped_assets
+          cd ./release_assets
+          for d in ./et4qml-* ./et4qml-android-*; do
+            if [[ -d "$d" ]]; then
+              zip -r "../zipped_assets/$d-${VERSION}.zip" "$d"
+            fi
+          done
+          ls -l ../zipped_assets
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version || github.ref_name }}
+          files: ./zipped_assets/*
