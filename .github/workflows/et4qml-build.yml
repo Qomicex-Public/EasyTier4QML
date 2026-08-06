@@ -7,9 +7,6 @@ on:
         description: 'Release version (e.g. 0.1.0). Leave empty to only build artifacts.'
         required: false
         default: ''
-  push:
-    branches: ["main"]
-    tags: ["v*"]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
