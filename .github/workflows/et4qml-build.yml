@@ -30,6 +30,9 @@ jobs:
           - os: ubuntu-latest
             NAME: linux-x86_64
             SUFFIX: ''
+          - os: macos-latest
+            NAME: macos-arm64
+            SUFFIX: ''
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -75,6 +78,9 @@ jobs:
           fi
           if [[ -f ./target/release/libeasytier_android_jni.so ]]; then
             cp ./target/release/libeasytier_android_jni.so ./artifacts/
+          fi
+          if [[ -f ./target/release/libeasytier_android_jni.dylib ]]; then
+            cp ./target/release/libeasytier_android_jni.dylib ./artifacts/
           fi
           ls -l ./artifacts
 
@@ -153,7 +159,6 @@ jobs:
         uses: actions/download-artifact@v5
         with:
           path: ./release_assets
-          merge-multiple: true
 
       - name: Zip release assets
         shell: bash
@@ -161,10 +166,9 @@ jobs:
           VERSION="${{ inputs.version || github.ref_name }}"
           mkdir -p ./zipped_assets
           cd ./release_assets
-          for d in ./et4qml-* ./et4qml-android-*; do
-            if [[ -d "$d" ]]; then
-              zip -r "../zipped_assets/$d-${VERSION}.zip" "$d"
-            fi
+          for d in */; do
+            name="${d%/}"
+            zip -r "../zipped_assets/$name-${VERSION}.zip" "$name"
           done
           ls -l ../zipped_assets
 
