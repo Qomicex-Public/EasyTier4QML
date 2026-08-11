@@ -45,6 +45,8 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           version: "25.1"
+          # GitHub repo token to use to avoid rate limiter
+          repo-token: ${{ github.token }}
 
       - name: Install LLVM (windows)
         if: runner.os == 'Windows'
@@ -130,6 +132,8 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           version: "25.1"
+          # GitHub repo token to use to avoid rate limiter
+          repo-token: ${{ github.token }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
