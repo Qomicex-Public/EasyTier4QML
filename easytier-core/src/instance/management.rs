@@ -201,6 +201,14 @@ where
         self.peer_manager.close_peer_conn(peer_id, conn_id).await
     }
 
+    /// 关闭与指定 peer 的全部连接（踢人场景的物理断开；对方若持续在线可能重连）。
+    pub async fn disconnect_peer(
+        &self,
+        peer_id: crate::config::PeerId,
+    ) -> Result<(), crate::tunnel::TunnelError> {
+        self.peer_manager.close_peer(peer_id).await
+    }
+
     pub async fn update_exit_nodes(&self, exit_nodes: Vec<IpAddr>) {
         self.peer_manager.update_exit_nodes(exit_nodes).await;
     }

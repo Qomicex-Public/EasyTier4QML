@@ -1549,6 +1549,14 @@ impl PeerManagerCore {
         .await
     }
 
+    /// 关闭与指定 peer 的全部连接（踢人场景的物理断开）。
+    ///
+    /// 仅断开当前连接，不阻止对方重连（控制面 deny 需 credential/ACL 支持，
+    /// 当前版本无 peer 级准入黑名单）。
+    pub async fn close_peer(&self, peer_id: PeerId) -> Result<(), crate::tunnel::TunnelError> {
+        self.peers.close_peer(peer_id).await
+    }
+
     async fn start_peer_recv(&self) {
         let packet_recv = self.packet_recv.lock().await.take().unwrap();
         let is_credential_node =
