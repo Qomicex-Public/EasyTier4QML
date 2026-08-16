@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use quanta::Instant;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
@@ -724,6 +724,8 @@ pub struct PeerManagerCore {
     traffic_metrics: Arc<TrafficMetricRecorder>,
     network_name: String,
     counters: PeerManagerTrafficCounters,
+    /// 被 deny 的 peer（踢人场景的持久物理封禁）：连接建立处（入站/出站）检查，命中即拒绝。
+    denied_peers: Arc<DashSet<PeerId>>,
 }
 
 fn check_resolved_remote_addr_not_from_virtual_network(
@@ -1028,6 +1030,7 @@ impl PeerManagerCore {
             peer_session_store.clone(),
         );
         let recent_traffic = RecentTrafficTracker::new(my_peer_id);
+        let denied_peers = Arc::new(DashSet::new());
         let peer_connection_admission = PeerConnectionAdmission::new(
             my_peer_id,
             context.clone(),
@@ -1036,6 +1039,7 @@ impl PeerManagerCore {
             foreign_network_manager.clone(),
             peer_session_store.clone(),
             recent_traffic.clone(),
+            denied_peers.clone(),
         );
         let route = route_algo_inst.route_arc();
         let outbound_packet_router = PeerOutboundPacketRouter::new(
@@ -1087,6 +1091,7 @@ impl PeerManagerCore {
             traffic_metrics,
             network_name,
             counters: self_tx_counters,
+            denied_peers,
         }
     }
 
@@ -1557,6 +1562,22 @@ impl PeerManagerCore {
         self.peers.close_peer(peer_id).await
     }
 
+    /// 将指定 peer 加入 deny 黑名单并立即断开其全部连接（踢人场景的**持久**物理封禁）。
+    ///
+    /// 与 [`Self::close_peer`] 的区别：deny 后该 peer 的入站/出站连接请求都会在
+    /// 连接建立处被拒绝（[`Error::PeerDenied`]），对方自动重连也连不上。
+    pub async fn deny_peer(&self, peer_id: PeerId) {
+        self.denied_peers.insert(peer_id);
+        if let Err(e) = self.close_peer(peer_id).await {
+            tracing::warn!(?peer_id, "deny peer: close existing connections failed: {e}");
+        }
+    }
+
+    /// 解除 deny（允许该 peer 重新连接）。
+    pub async fn allow_peer(&self, peer_id: PeerId) {
+        self.denied_peers.remove(&peer_id);
+    }
+
     async fn start_peer_recv(&self) {
         let packet_recv = self.packet_recv.lock().await.take().unwrap();
         let is_credential_node =
@@ -1687,6 +1708,8 @@ pub(crate) struct PeerConnectionAdmission {
     peer_session_store: Arc<PeerSessionStore>,
     recent_traffic: RecentTrafficTracker,
     reserved_my_peer_id_map: DashMap<String, PeerId>,
+    /// deny 黑名单（与 PeerManagerCore.denied_peers 共享同一实例）。
+    denied_peers: Arc<DashSet<PeerId>>,
 }
 
 impl PeerConnectionAdmission {
@@ -1698,6 +1721,7 @@ impl PeerConnectionAdmission {
         foreign_network_manager: Arc<ForeignNetworkManager>,
         peer_session_store: Arc<PeerSessionStore>,
         recent_traffic: RecentTrafficTracker,
+        denied_peers: Arc<DashSet<PeerId>>,
     ) -> Self {
         Self {
             my_peer_id,
@@ -1708,7 +1732,13 @@ impl PeerConnectionAdmission {
             peer_session_store,
             recent_traffic,
             reserved_my_peer_id_map: DashMap::new(),
+            denied_peers,
         }
+    }
+
+    /// peer 是否在 deny 黑名单中（连接建立处准入检查）。
+    fn is_peer_denied(&self, peer_id: PeerId) -> bool {
+        self.denied_peers.contains(&peer_id)
     }
 
     pub async fn add_client_tunnel(
@@ -1737,6 +1767,9 @@ impl PeerConnectionAdmission {
         peer.do_handshake_as_client().await?;
         let conn_id = peer.get_conn_id();
         let peer_id = peer.get_peer_id();
+        if self.is_peer_denied(peer_id) {
+            return Err(Error::PeerDenied(peer_id));
+        }
         let local_identity = self.context.network_identity();
         if peer.get_network_identity().network_name == local_identity.network_name {
             let local_secure_mode = self
@@ -1843,6 +1876,11 @@ impl PeerConnectionAdmission {
         }
 
         conn.set_is_hole_punched(!is_directly_connected);
+
+        if self.is_peer_denied(conn.get_peer_id()) {
+            self.release_reserved_peer_id(&peer_network_name);
+            return Err(Error::PeerDenied(conn.get_peer_id()));
+        }
 
         let add_peer_ret = if is_local_network {
             let local_secure_mode = self

@@ -209,6 +209,20 @@ where
         self.peer_manager.close_peer(peer_id).await
     }
 
+    /// 将指定 peer 加入 deny 黑名单并立即断开其全部连接（踢人场景的**持久**物理封禁）。
+    ///
+    /// 与 [`Self::disconnect_peer`] 的区别：deny 后该 peer 的入站/出站连接请求都会在
+    /// 连接建立处被拒（`PeerDenied`），对方自动重连也连不上。
+    pub async fn deny_peer(&self, peer_id: crate::config::PeerId) -> Result<(), crate::tunnel::TunnelError> {
+        self.peer_manager.deny_peer(peer_id).await;
+        Ok(())
+    }
+
+    /// 解除 deny（允许该 peer 重新连接）。
+    pub async fn allow_peer(&self, peer_id: crate::config::PeerId) {
+        self.peer_manager.allow_peer(peer_id).await;
+    }
+
     pub async fn update_exit_nodes(&self, exit_nodes: Vec<IpAddr>) {
         self.peer_manager.update_exit_nodes(exit_nodes).await;
     }

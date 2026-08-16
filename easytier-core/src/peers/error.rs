@@ -8,6 +8,8 @@ pub enum Error {
     SecretKeyError(String),
     #[error("peer has no connection: {0}")]
     PeerNoConnectionError(PeerId),
+    #[error("peer is denied: {0}")]
+    PeerDenied(PeerId),
     #[error("route error: {0:?}")]
     RouteError(Option<String>),
     #[error("not found")]
