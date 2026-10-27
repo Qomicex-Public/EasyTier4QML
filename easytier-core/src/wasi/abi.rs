@@ -29,8 +29,20 @@ pub const HOST_CRYPTO_AUTH_FAILED: i32 = -10;
 /// Version of the JSON document accepted by `easytier_instance_create`.
 pub const CORE_INSTANCE_CONFIG_VERSION: u32 = 14;
 
+/// Version of the JSON document accepted by `easytier_web_client_create`.
+#[cfg(feature = "management")]
+pub const WEB_CLIENT_CONFIG_VERSION: u32 = 1;
+
 /// Version of the public data-plane guest export contract.
-pub const DATA_PLANE_ABI_VERSION: u32 = 3;
+pub const DATA_PLANE_ABI_VERSION: u32 = 4;
+
+/// Version of the protobuf RPC guest export contract.
+#[cfg(feature = "management-rpc")]
+pub const RPC_ABI_VERSION: u32 = 2;
+
+/// `easytier_rpc_response_take` has not completed yet.
+#[cfg(feature = "management-rpc")]
+pub const RPC_STATUS_PENDING: i32 = -6;
 
 /// The guest exposes an instance-scoped data-plane operation broker.
 pub const DATA_PLANE_CAPABILITY: u64 = 1 << 0;
@@ -42,6 +54,8 @@ pub const DATA_PLANE_UDP_CAPABILITY: u64 = 1 << 2;
 pub const DATA_PLANE_DEADLINE_READ: u32 = 1 << 0;
 /// Update the write deadline in `easytier_data_plane_resource_deadline_set`.
 pub const DATA_PLANE_DEADLINE_WRITE: u32 = 1 << 1;
+/// Version of the host tunnel metadata and export contract.
+pub const HOST_TUNNEL_ABI_VERSION: u32 = 1;
 
 /// Guest exports a WASI runtime calls to manage a core instance.
 ///
@@ -50,6 +64,16 @@ pub const DATA_PLANE_DEADLINE_WRITE: u32 = 1 << 1;
 /// all asynchronous guest work through `easytier_instance_drive` and host
 /// completion notifications.
 pub const GUEST_EXPORTS: &[&str] = &[
+    // WASI command initialization. This only binds the runtime; core lifecycle
+    // still starts through the instance exports below.
+    "_start",
+    // Module-wide logging; no instance handle is required. Levels 0..=5 are
+    // off, error, warn, info, debug, trace (matching api.logger.LogLevel).
+    // set_level(u32) -> i32 returns 0, or -3 without changing the level for
+    // invalid input. level() -> u32 defaults to info. _start is idempotent
+    // and does not reset the level. Output uses the WASI stdout sink.
+    "easytier_logger_set_level",
+    "easytier_logger_level",
     // Guest-memory buffers.
     "easytier_buffer_alloc",
     "easytier_buffer_free",
@@ -68,6 +92,45 @@ pub const GUEST_EXPORTS: &[&str] = &[
     "easytier_instance_error_copy",
 ];
 
+/// Guest exports present when process-level WebClient management is enabled.
+#[cfg(feature = "management")]
+pub const WEB_CLIENT_GUEST_EXPORTS: &[&str] = &[
+    "easytier_web_client_create",
+    "easytier_web_client_drive",
+    "easytier_web_client_notify_completions",
+    "easytier_web_client_next_deadline_millis",
+    "easytier_web_client_is_connected",
+    "easytier_web_client_drop",
+];
+
+/// Guest exports present when protobuf management RPC is enabled.
+///
+/// `easytier_rpc_request_submit` accepts a serialized
+/// `common.DirectRpcRequest`. Its `full_method_name` uses the canonical
+/// protobuf reflection name, and `request` contains the serialized protobuf
+/// input. An absent `timeout_ms` means the dispatcher has no timeout.
+/// `easytier_rpc_response_take` returns a serialized `common.RpcResponse`,
+/// including any method error.
+/// Submit writes an opaque big-endian `u64` operation ID. A response take
+/// returns [`RPC_STATUS_PENDING`] while running; `(output, capacity) == (0,
+/// 0)` probes the size, and an undersized buffer returns the required size
+/// without consuming the response. Free cancels pending work and discards
+/// any retained result.
+#[cfg(feature = "management-rpc")]
+pub const RPC_GUEST_EXPORTS: &[&str] = &[
+    "easytier_rpc_abi_version",
+    "easytier_rpc_request_submit",
+    "easytier_rpc_response_take",
+    "easytier_rpc_operation_free",
+];
+
+/// Guest exports present with the host tunnel feature.
+#[cfg(feature = "wasm-host-tunnel")]
+pub const HOST_TUNNEL_GUEST_EXPORTS: &[&str] = &[
+    "easytier_host_tunnel_abi_version",
+    "easytier_instance_accept_tunnel",
+];
+
 /// Guest exports present when the core is built with the smoltcp data plane.
 #[cfg(feature = "proxy-smoltcp-stack")]
 pub const DATA_PLANE_GUEST_EXPORTS: &[&str] = &[
@@ -80,6 +143,7 @@ pub const DATA_PLANE_GUEST_EXPORTS: &[&str] = &[
     "easytier_data_plane_tcp_accept_submit",
     "easytier_data_plane_tcp_read_submit",
     "easytier_data_plane_tcp_write_submit",
+    "easytier_data_plane_tcp_shutdown_write_submit",
     "easytier_data_plane_udp_bind_submit",
     "easytier_data_plane_udp_receive_submit",
     "easytier_data_plane_udp_send_submit",
@@ -92,6 +156,7 @@ pub const DATA_PLANE_GUEST_EXPORTS: &[&str] = &[
     "easytier_data_plane_tcp_accept_result_take",
     "easytier_data_plane_tcp_read_result_take",
     "easytier_data_plane_tcp_write_result_take",
+    "easytier_data_plane_tcp_shutdown_write_result_take",
     "easytier_data_plane_udp_bind_result_take",
     "easytier_data_plane_udp_receive_result_take",
     "easytier_data_plane_udp_send_result_take",

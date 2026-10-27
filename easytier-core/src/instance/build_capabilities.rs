@@ -8,6 +8,7 @@ use crate::config::{peers::PeerRuntimeSnapshot, runtime::CoreRuntimeConfig};
 use super::CoreInstanceConfig;
 
 const DHCP_IPV4_AVAILABLE: bool = cfg!(feature = "dhcp-ipv4");
+const DHCP_IPV6_AVAILABLE: bool = cfg!(feature = "dhcp-ipv6");
 const SMOLTCP_GATEWAY_AVAILABLE: bool = cfg!(feature = "proxy-smoltcp-stack");
 const PACKET_PROXY_AVAILABLE: bool = cfg!(feature = "proxy-packet");
 const PROXY_CIDR_MONITOR_AVAILABLE: bool = cfg!(feature = "proxy-cidr-monitor");
@@ -28,6 +29,7 @@ fn validate_snapshot(
 ) -> anyhow::Result<()> {
     let core = &peer.runtime.core;
     require(DHCP_IPV4_AVAILABLE, runtime.dhcp_ipv4, "DHCP IPv4")?;
+    require(DHCP_IPV6_AVAILABLE, runtime.dhcp_ipv6, "DHCP IPv6")?;
     require(
         SMOLTCP_GATEWAY_AVAILABLE,
         runtime.gateway.socks5_bind.is_some() || !runtime.gateway.port_forwards.is_empty(),
@@ -60,16 +62,16 @@ fn validate_snapshot(
             || runtime.public_ipv6_provider.configured_prefix.is_some(),
         "public IPv6 services",
     )?;
-    require(
-        VPN_PORTAL_AVAILABLE,
-        peer.vpn_portal_cidr.is_some(),
-        "the VPN portal",
-    )?;
     Ok(())
 }
 
 pub(super) fn validate(config: &CoreInstanceConfig) -> anyhow::Result<()> {
-    validate_snapshot(&config.connectivity.runtime, &config.peer.snapshot)
+    validate_snapshot(&config.connectivity.runtime, &config.peer.snapshot)?;
+    require(
+        VPN_PORTAL_AVAILABLE,
+        config.vpn_portal.is_some(),
+        "the VPN portal",
+    )
 }
 
 pub(super) fn validate_runtime(

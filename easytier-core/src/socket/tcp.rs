@@ -55,6 +55,12 @@ pub enum TcpSocketPurpose {
 pub struct TcpBindOptions {
     #[serde(default)]
     pub context: SocketContext,
+    /// Request host VPN bypass during creation, before bind/connect/listen.
+    /// Hosts with a protection service must await its acknowledgement; local
+    /// listeners opt out explicitly. Defaults to true, including when omitted
+    /// from serialized options. Accepted children inherit this requirement.
+    #[serde(default = "super::default_need_protect")]
+    pub need_protect: bool,
     pub local_addr: Option<SocketAddr>,
     pub bind_device: Option<String>,
     /// `None` delegates the platform default to the host socket adapter.
@@ -67,6 +73,7 @@ impl TcpBindOptions {
     pub fn new() -> Self {
         Self {
             context: SocketContext::default(),
+            need_protect: super::default_need_protect(),
             local_addr: None,
             bind_device: None,
             reuse_addr: None,
@@ -87,6 +94,11 @@ impl TcpBindOptions {
 
     pub fn with_context(mut self, context: SocketContext) -> Self {
         self.context = context;
+        self
+    }
+
+    pub fn with_need_protect(mut self, need_protect: bool) -> Self {
+        self.need_protect = need_protect;
         self
     }
 
@@ -250,28 +262,36 @@ impl TcpListenOptions {
 
     pub fn proxy_nat(local_addr: SocketAddr) -> Self {
         Self {
-            bind: TcpBindOptions::default().with_local_addr(Some(local_addr)),
+            bind: TcpBindOptions::default()
+                .with_need_protect(false)
+                .with_local_addr(Some(local_addr)),
             purpose: TcpListenPurpose::ProxyNat,
         }
     }
 
     pub fn socks5(local_addr: SocketAddr) -> Self {
         Self {
-            bind: TcpBindOptions::default().with_local_addr(Some(local_addr)),
+            bind: TcpBindOptions::default()
+                .with_need_protect(false)
+                .with_local_addr(Some(local_addr)),
             purpose: TcpListenPurpose::Socks5,
         }
     }
 
     pub fn port_forward(local_addr: SocketAddr) -> Self {
         Self {
-            bind: TcpBindOptions::default().with_local_addr(Some(local_addr)),
+            bind: TcpBindOptions::default()
+                .with_need_protect(false)
+                .with_local_addr(Some(local_addr)),
             purpose: TcpListenPurpose::PortForward,
         }
     }
 
     pub fn port_lease(local_addr: SocketAddr) -> Self {
         Self {
-            bind: TcpBindOptions::default().with_local_addr(Some(local_addr)),
+            bind: TcpBindOptions::default()
+                .with_need_protect(false)
+                .with_local_addr(Some(local_addr)),
             purpose: TcpListenPurpose::PortLease,
         }
     }
@@ -343,15 +363,14 @@ where
     type Accepted = AcceptedTcpSocket<F>;
 
     async fn listen(&mut self) -> anyhow::Result<()> {
-        if self.listener.is_some() {
-            return Ok(());
-        }
-
+        // Calling listen again replaces the old binding, including after an error.
+        self.listener = None;
         let listener = self.factory.bind_tcp(self.options.clone()).await?;
         let local_addr = listener.local_addr()?;
         self.url
             .set_port(Some(local_addr.port()))
             .map_err(|_| anyhow::anyhow!("failed to update tcp listener port for {}", self.url))?;
+        self.options.bind.local_addr = Some(local_addr);
         self.listener = Some(listener);
         Ok(())
     }
@@ -361,7 +380,7 @@ where
             let listener = self.listener()?;
             match listener.accept().await {
                 Ok((socket, _)) => return Ok(socket),
-                Err(error) if is_retryable_tcp_accept_error(&error) => {
+                Err(error) if is_retryable_tcp_io_error(&error) => {
                     tracing::warn!(?error, "tcp accept failed with retryable error");
                 }
                 Err(error) => {
@@ -377,7 +396,7 @@ where
     }
 }
 
-fn is_retryable_tcp_accept_error(error: &io::Error) -> bool {
+pub(crate) fn is_retryable_tcp_io_error(error: &io::Error) -> bool {
     use io::ErrorKind::*;
     matches!(
         error.kind(),
@@ -612,7 +631,9 @@ mod tests {
         assert_eq!(
             TcpListenOptions::proxy_nat(local_addr),
             TcpListenOptions {
-                bind: TcpBindOptions::default().with_local_addr(Some(local_addr)),
+                bind: TcpBindOptions::default()
+                    .with_need_protect(false)
+                    .with_local_addr(Some(local_addr)),
                 purpose: TcpListenPurpose::ProxyNat,
             }
         );
@@ -633,6 +654,7 @@ mod tests {
             options,
             TcpBindOptions {
                 context: SocketContext::default().with_socket_mark(Some(7)),
+                need_protect: true,
                 local_addr: Some(local_addr),
                 bind_device: Some("eth0".to_owned()),
                 reuse_addr: Some(true),
@@ -645,6 +667,37 @@ mod tests {
     #[test]
     fn tcp_bind_default_delegates_reuse_addr_policy_to_host() {
         assert_eq!(TcpBindOptions::default().reuse_addr, None);
+        assert!(TcpBindOptions::default().need_protect);
+    }
+
+    #[test]
+    fn tcp_constructor_protection_defaults_match_endpoint_role() {
+        let remote = SocketAddr::from(([192, 0, 2, 1], 11010));
+        let local = SocketAddr::from(([0, 0, 0, 0], 11010));
+
+        assert!(TcpConnectOptions::direct_connect(remote).bind.need_protect);
+        assert!(TcpConnectOptions::proxy_nat(remote).bind.need_protect);
+        assert!(TcpListenOptions::direct_connect(local).bind.need_protect);
+        assert!(TcpListenOptions::hole_punch(local).bind.need_protect);
+        assert!(TcpListenOptions::manual_connect(local).bind.need_protect);
+        assert!(!TcpListenOptions::proxy_nat(local).bind.need_protect);
+        assert!(!TcpListenOptions::socks5(local).bind.need_protect);
+        assert!(!TcpListenOptions::port_forward(local).bind.need_protect);
+        assert!(!TcpListenOptions::port_lease(local).bind.need_protect);
+    }
+
+    #[test]
+    fn tcp_bind_serde_defaults_to_protected_and_preserves_opt_out() {
+        let options: TcpBindOptions = serde_json::from_str(
+            r#"{"local_addr":null,"bind_device":null,"reuse_addr":null,"reuse_port":false,"only_v6":false}"#,
+        )
+        .unwrap();
+        assert!(options.need_protect);
+        let local = TcpListenOptions::port_forward("0.0.0.0:15555".parse().unwrap());
+        let restored: TcpListenOptions =
+            serde_json::from_str(&serde_json::to_string(&local).unwrap()).unwrap();
+        assert_eq!(restored, local);
+        assert!(!restored.bind.need_protect);
     }
 
     #[tokio::test]
@@ -695,5 +748,26 @@ mod tests {
         let accepted = socket_listener.accept().await.unwrap();
 
         assert_eq!(accepted.peer_addr().unwrap(), peer_addr);
+    }
+    #[tokio::test]
+    async fn tcp_socket_listener_releases_failed_binding_and_keeps_assigned_port() {
+        let bound_addr: SocketAddr = "127.0.0.1:12010".parse().unwrap();
+        let listener = Arc::new(MockTcpListener::new(
+            bound_addr,
+            vec![Err(io::ErrorKind::BrokenPipe.into())],
+        ));
+        let factory = Arc::new(MockTcpListenerFactory::new(listener));
+        let mut socket_listener = TcpSocketListener::new_with_options(
+            "tcp://127.0.0.1:0".parse().unwrap(),
+            TcpListenOptions::direct_connect("127.0.0.1:0".parse().unwrap()),
+            factory.clone(),
+        );
+        socket_listener.listen().await.unwrap();
+        assert!(socket_listener.accept().await.is_err());
+        assert!(socket_listener.listener.is_some());
+        socket_listener.listen().await.unwrap();
+        let binds = factory.binds.lock().unwrap();
+        assert_eq!(binds.len(), 2);
+        assert_eq!(binds[1].bind.local_addr, Some(bound_addr));
     }
 }

@@ -6,9 +6,16 @@
 //! egress, environment facts, and the WASI mechanism backend) live in
 //! [`crate::host`].
 
+pub mod retry;
 pub mod ring;
 pub mod tcp;
 pub mod udp;
+
+/// Keep Rust constructors and deserialization consistent: host sockets normally
+/// need VPN bypass; local/TUN-facing endpoint constructors explicitly opt out.
+pub(crate) const fn default_need_protect() -> bool {
+    true
+}
 
 use std::{fmt::Debug, sync::Arc};
 

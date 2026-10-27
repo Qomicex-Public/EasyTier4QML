@@ -1,3 +1,5 @@
+#![cfg(feature = "cli")]
+
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsString,
@@ -22,7 +24,8 @@ use easytier_core::connectivity::stun::StunInfoProvider as _;
 use humansize::format_size;
 use rust_i18n::t;
 use service_manager::*;
-use tabled::settings::{Disable, Modify, Style, Width, location::ByColumnName, object::Columns};
+use sha2::{Digest as _, Sha256};
+use tabled::settings::{Modify, Remove, Style, Width, location::ByColumnName, object::Columns};
 use terminal_size::{Width as TerminalWidth, terminal_size};
 use unicode_width::UnicodeWidthStr;
 
@@ -32,15 +35,16 @@ use tokio::time::timeout;
 use easytier::{
     common::{constants::EASYTIER_VERSION, stun::runtime_stun_info_collector},
     proto::{
-        acl::AclStats,
+        acl::{Acl, AclStats},
         api::{
             config::{
                 AclPatch, ConfigPatchAction, ConfigRpc, ConfigRpcClientFactory,
                 InstanceConfigPatch, PatchConfigRequest, PortForwardPatch, StringPatch, UrlPatch,
+                VpnPortalClientPatch,
             },
             instance::{
                 AclManageRpc, AclManageRpcClientFactory, Connector, ConnectorManageRpc,
-                ConnectorManageRpcClientFactory, CredentialManageRpc,
+                ConnectorManageRpcClientFactory, CredentialInfo, CredentialManageRpc,
                 CredentialManageRpcClientFactory, DumpRouteRequest, ForeignNetworkEntryPb,
                 GenerateCredentialRequest, GetAclStatsRequest, GetPrometheusStatsRequest,
                 GetStatsRequest, GetVpnPortalInfoRequest, GetWhitelistRequest,
@@ -50,8 +54,8 @@ use easytier::{
                 ListPeerResponse, ListPortForwardRequest, ListPortForwardResponse,
                 ListPublicIpv6InfoRequest, ListPublicIpv6InfoResponse, ListRouteRequest,
                 ListRouteResponse, MappedListener, MappedListenerManageRpc,
-                MappedListenerManageRpcClientFactory, MetricSnapshot, NodeInfo, PeerManageRpc,
-                PeerManageRpcClientFactory, PortForwardManageRpc,
+                MappedListenerManageRpcClientFactory, MetricSnapshot, NodeInfo, PeerInfo,
+                PeerManageRpc, PeerManageRpcClientFactory, PortForwardManageRpc,
                 PortForwardManageRpcClientFactory, RevokeCredentialRequest, Route as ApiRoute,
                 ShowNodeInfoRequest, StatsRpc, StatsRpcClientFactory, TcpProxyEntryState,
                 TcpProxyEntryTransportType, TcpProxyRpc, TcpProxyRpcClientFactory,
@@ -64,12 +68,16 @@ use easytier::{
                 SetLoggerConfigRequest,
             },
             manage::{
-                ListNetworkInstanceMetaRequest, ListNetworkInstanceRequest, WebClientService,
+                ListNetworkInstanceMetaRequest, ListNetworkInstanceRequest,
+                VpnPortalClientConfig as ManageVpnPortalClientConfig, WebClientService,
                 WebClientServiceClientFactory,
             },
         },
         common::{NatType, PortForwardConfigPb, SocketType},
-        peer_rpc::{GetGlobalPeerMapRequest, PeerCenterRpc, PeerCenterRpcClientFactory},
+        peer_rpc::{
+            GetGlobalPeerMapRequest, PeerCenterRpc, PeerCenterRpcClientFactory, PeerIdentityType,
+            SecureAuthLevel,
+        },
         rpc::standalone::{RuntimeRpcClient, runtime_rpc_client},
         rpc_types::{controller::BaseController, error::Error as RpcError},
     },
@@ -130,8 +138,8 @@ enum SubCommand {
     Route(RouteArgs),
     #[command(about = "show global peers info")]
     PeerCenter,
-    #[command(about = "show vpn portal (wireguard) info")]
-    VpnPortal,
+    #[command(about = "manage vpn portal (wireguard) clients")]
+    VpnPortal(VpnPortalArgs),
     #[command(about = "inspect self easytier-core status")]
     Node(NodeArgs),
     #[command(about = "manage easytier-core as a system service")]
@@ -265,6 +273,32 @@ enum MappedListenerSubCommand {
     List,
 }
 
+#[derive(Args, Debug)]
+struct VpnPortalArgs {
+    #[command(subcommand)]
+    sub_command: Option<VpnPortalSubCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum VpnPortalSubCommand {
+    /// Add a WireGuard portal client
+    AddClient {
+        #[arg(help = "client name")]
+        name: String,
+        #[arg(long, help = "client virtual IPv4 CIDR inside the mesh network")]
+        virtual_ip: String,
+        #[arg(long, help = "ACL groups assigned to the client")]
+        groups: Vec<String>,
+    },
+    /// Remove a WireGuard portal client
+    RemoveClient {
+        #[arg(help = "client name")]
+        name: String,
+    },
+    /// Remove all WireGuard portal clients
+    ClearClients,
+}
+
 #[derive(Subcommand, Debug)]
 enum NodeSubCommand {
     #[command(about = "show node info")]
@@ -285,10 +319,38 @@ struct AclArgs {
     sub_command: Option<AclSubCommand>,
 }
 
+#[derive(Args, Debug)]
+struct AclSetArgs {
+    /// Full ACL as a TOML string, or a path to a TOML file prefixed by '@'.
+    ///
+    /// The TOML uses the same shape as the `[acl]` section of an easytier
+    /// configuration file, for example:
+    ///
+    /// ```toml
+    /// [acl.acl_v1]
+    /// [[acl.acl_v1.chains]]
+    /// name = "Inbound"
+    /// chain_type = 1
+    /// enabled = true
+    /// default_action = 2
+    /// [[acl.acl_v1.chains.rules]]
+    /// protocol = 3
+    /// action = 1
+    /// ```
+    ///
+    /// Using `@/path/to/acl.toml` makes it easy to manage and debug the full
+    /// ACL offline. The whole ACL is replaced at runtime without restarting
+    /// easytier-core.
+    #[arg(help = "full ACL TOML string or '@path/to/acl.toml'")]
+    acl: String,
+}
+
 #[derive(Subcommand, Debug)]
 enum AclSubCommand {
     /// Show ACL rule hit statistics
     Stats,
+    /// Replace the whole ACL at runtime without restarting easytier-core
+    Set(AclSetArgs),
 }
 
 #[derive(Args, Debug)]
@@ -425,6 +487,11 @@ enum CredentialSubCommand {
     },
     /// List all active credentials
     List,
+    /// Show credentials and their currently authenticated direct peers
+    ///
+    /// Run on a node storing the credentials. Relayed users are not included;
+    /// an empty peer list does not mean the credential is unused elsewhere.
+    Peers,
 }
 
 #[derive(Args, Debug)]
@@ -477,9 +544,10 @@ struct InstallArgs {
     service_work_dir: Option<PathBuf>,
 
     #[arg(
-        trailing_var_arg = true,
+        long,
+        num_args = 1..,
         allow_hyphen_values = true,
-        help = "args to pass to easytier-core"
+        help = "args to pass to easytier-core, must be the last option of install"
     )]
     core_args: Option<Vec<OsString>>,
 }
@@ -537,6 +605,17 @@ type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + 'a>
 type ForeignNetworkMap = BTreeMap<String, ForeignNetworkEntryPb>;
 type GlobalForeignNetworkMap = BTreeMap<u32, list_global_foreign_network_response::ForeignNetworks>;
 
+const ROUTE_OPTIONAL_COLUMNS: &[&str] = &["hostname"];
+const ROUTE_DROP_COLUMNS: &[&str] = &[
+    "version",
+    "next_hop_hostname_lat_first",
+    "next_hop_ipv4_lat_first",
+    "path_len_lat_first",
+    "path_latency_lat_first",
+    "next_hop_hostname",
+    "next_hop_lat",
+];
+
 fn is_missing_web_client_service(error: &RpcError) -> bool {
     matches!(
         error,
@@ -545,9 +624,361 @@ fn is_missing_web_client_service(error: &RpcError) -> bool {
     )
 }
 
+fn parse_vpn_portal_client_cidr(value: &str) -> anyhow::Result<cidr::Ipv4Inet> {
+    let value = value.trim();
+    if !value.contains('/') {
+        anyhow::bail!("client virtual IPv4 must include its network prefix");
+    }
+    value
+        .parse::<cidr::Ipv4Inet>()
+        .map_err(|error| anyhow::anyhow!("invalid client virtual IPv4 CIDR ({value}): {error}"))
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CredentialPeersData {
+    credentials: Vec<CredentialPeersEntry>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CredentialPeersEntry {
+    credential_id: String,
+    peers: Vec<CredentialPeerNode>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct CredentialPeerNode {
+    peer_id: u32,
+    ipv4: Option<String>,
+    ipv6: Option<String>,
+    hostname: String,
+}
+
+fn build_credential_peers(
+    credentials: Vec<CredentialInfo>,
+    peers: Vec<PeerInfo>,
+    routes: Vec<ApiRoute>,
+) -> CredentialPeersData {
+    let routes = routes
+        .into_iter()
+        .map(|route| (route.peer_id, route))
+        .collect::<HashMap<_, _>>();
+    let mut peers_by_fingerprint = HashMap::<String, BTreeMap<u32, CredentialPeerNode>>::new();
+    for peer in peers {
+        for conn in &peer.conns {
+            if conn.is_closed
+                || conn.peer_identity_type != PeerIdentityType::Credential as i32
+                || !matches!(
+                    SecureAuthLevel::try_from(conn.secure_auth_level),
+                    Ok(SecureAuthLevel::PeerVerified | SecureAuthLevel::NetworkSecretConfirmed)
+                )
+                || conn.noise_remote_static_pubkey.len() != 32
+            {
+                continue;
+            }
+            // Match the SHA-256 fingerprint returned by ListCredentials. Only
+            // authenticated remote connection keys identify credential users;
+            // route advertisements alone do not establish this association.
+            let fingerprint = Sha256::digest(&conn.noise_remote_static_pubkey)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let route = routes.get(&peer.peer_id);
+            peers_by_fingerprint
+                .entry(fingerprint)
+                .or_default()
+                .entry(peer.peer_id)
+                .or_insert_with(|| CredentialPeerNode {
+                    peer_id: peer.peer_id,
+                    ipv4: route
+                        .and_then(|route| route.ipv4_addr)
+                        .and_then(|inet| inet.address)
+                        .map(|address| address.to_string()),
+                    ipv6: route
+                        .and_then(|route| route.ipv6_addr)
+                        .and_then(|inet| inet.address)
+                        .map(|address| address.to_string()),
+                    hostname: route
+                        .map(|route| route.hostname.clone())
+                        .unwrap_or_default(),
+                });
+        }
+    }
+    let mut credentials = credentials
+        .into_iter()
+        .map(|credential| CredentialPeersEntry {
+            peers: peers_by_fingerprint
+                .get(&credential.public_key_fingerprint)
+                .map(|peers| peers.values().cloned().collect())
+                .unwrap_or_default(),
+            credential_id: credential.credential_id,
+        })
+        .collect::<Vec<_>>();
+    credentials.sort_by(|a, b| a.credential_id.cmp(&b.credential_id));
+    CredentialPeersData { credentials }
+}
+
+fn format_credential_peers(data: &CredentialPeersData) -> String {
+    if data.credentials.is_empty() {
+        return "No active credentials".to_owned();
+    }
+    let mut builder = tabled::builder::Builder::default();
+    builder.push_record(["Credential ID", "Peer ID", "IPv4", "IPv6", "Hostname"]);
+    for credential in &data.credentials {
+        if credential.peers.is_empty() {
+            builder.push_record([&credential.credential_id, "no direct peers", "-", "-", "-"]);
+        }
+        for peer in &credential.peers {
+            builder.push_record([
+                &credential.credential_id,
+                &peer.peer_id.to_string(),
+                peer.ipv4.as_deref().unwrap_or("-"),
+                peer.ipv6.as_deref().unwrap_or("-"),
+                &peer.hostname,
+            ]);
+        }
+    }
+    builder.build().with(Style::rounded()).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use easytier::proto::api::instance::PeerConnInfo;
+
+    const CREDENTIAL_FINGERPRINT: &str =
+        "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0";
+
+    fn credential(id: &str) -> CredentialInfo {
+        CredentialInfo {
+            credential_id: id.to_owned(),
+            public_key_fingerprint: CREDENTIAL_FINGERPRINT.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn credential_peer(peer_id: u32) -> PeerInfo {
+        PeerInfo {
+            peer_id,
+            conns: vec![PeerConnInfo {
+                peer_id,
+                noise_remote_static_pubkey: vec![7; 32],
+                peer_identity_type: PeerIdentityType::Credential as i32,
+                secure_auth_level: SecureAuthLevel::PeerVerified as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn credential_route(peer_id: u32, ipv4: &str) -> ApiRoute {
+        ApiRoute {
+            peer_id,
+            ipv4_addr: Some(ipv4.parse().unwrap()),
+            ipv6_addr: Some("fd00::2/64".parse().unwrap()),
+            hostname: format!("peer-{peer_id}"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn credential_peers_command_parses_without_changing_list() {
+        let cli = Cli::try_parse_from([
+            "easytier-cli",
+            "-n",
+            "network",
+            "-o",
+            "json",
+            "credential",
+            "peers",
+        ])
+        .unwrap();
+        assert_eq!(cli.instance_select.name.as_deref(), Some("network"));
+        assert_eq!(cli.output_format, OutputFormat::Json);
+        assert!(matches!(
+            cli.sub_command,
+            SubCommand::Credential(CredentialArgs {
+                sub_command: CredentialSubCommand::Peers,
+            })
+        ));
+        let cli = Cli::try_parse_from(["easytier-cli", "credential", "list"]).unwrap();
+        assert!(matches!(
+            cli.sub_command,
+            SubCommand::Credential(CredentialArgs {
+                sub_command: CredentialSubCommand::List,
+            })
+        ));
+    }
+
+    #[test]
+    fn credential_peers_matches_remote_fingerprint_and_virtual_addresses() {
+        let data = build_credential_peers(
+            vec![credential("user")],
+            vec![credential_peer(42)],
+            vec![credential_route(42, "10.252.9.2/24")],
+        );
+        let peer = &data.credentials[0].peers[0];
+        assert_eq!(peer.peer_id, 42);
+        assert_eq!(peer.ipv4.as_deref(), Some("10.252.9.2"));
+        assert_eq!(peer.ipv6.as_deref(), Some("fd00::2"));
+        assert_eq!(peer.hostname, "peer-42");
+        let json = serde_json::to_value(&data).unwrap();
+        assert_eq!(json["credentials"][0]["credential_id"], "user");
+        assert_eq!(json["credentials"][0]["peers"][0]["peer_id"], 42);
+        assert_eq!(json["credentials"][0]["peers"][0]["ipv4"], "10.252.9.2");
+        let json = json.to_string();
+        assert!(!json.contains("secret"));
+        assert!(!json.contains("pubkey"));
+        assert!(!json.contains("fingerprint"));
+        let table = format_credential_peers(&data);
+        assert!(table.contains("10.252.9.2"));
+        assert!(table.contains("fd00::2"));
+        assert!(table.contains("peer-42"));
+    }
+
+    #[test]
+    fn credential_peers_supports_reuse_and_deduplicates_connections() {
+        let mut peer = credential_peer(9);
+        peer.conns.push(peer.conns[0].clone());
+        let data = build_credential_peers(
+            vec![credential("user")],
+            vec![peer, credential_peer(2)],
+            vec![
+                credential_route(9, "10.252.9.9/24"),
+                credential_route(2, "10.252.9.2/24"),
+            ],
+        );
+        let peers = &data.credentials[0].peers;
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].peer_id, 2);
+        assert_eq!(peers[1].peer_id, 9);
+    }
+
+    #[test]
+    fn credential_peers_ignores_closed_unverified_and_noncredential_connections() {
+        let original = credential_peer(42);
+        let mut variants = Vec::new();
+        let mut closed = original.clone();
+        closed.conns[0].is_closed = true;
+        variants.push(closed);
+        for identity in [PeerIdentityType::Admin, PeerIdentityType::SharedNode] {
+            let mut peer = original.clone();
+            peer.conns[0].peer_identity_type = identity as i32;
+            variants.push(peer);
+        }
+        for auth in [
+            SecureAuthLevel::None as i32,
+            SecureAuthLevel::EncryptedUnauthenticated as i32,
+            999,
+        ] {
+            let mut peer = original.clone();
+            peer.conns[0].secure_auth_level = auth;
+            variants.push(peer);
+        }
+        for key in [Vec::new(), vec![7; 31], vec![7; 33], vec![8; 32]] {
+            let mut peer = original.clone();
+            peer.conns[0].noise_remote_static_pubkey = key;
+            // A matching local key must not associate a different remote key.
+            peer.conns[0].noise_local_static_pubkey = vec![7; 32];
+            variants.push(peer);
+        }
+        for peer in variants {
+            let data = build_credential_peers(
+                vec![credential("user")],
+                vec![peer],
+                vec![credential_route(42, "10.252.9.2/24")],
+            );
+            assert!(data.credentials[0].peers.is_empty());
+        }
+    }
+
+    #[test]
+    fn credential_peers_keeps_unmatched_credentials_without_claiming_global_offline_status() {
+        let mut legacy = credential("legacy");
+        legacy.public_key_fingerprint.clear();
+        let data = build_credential_peers(
+            vec![credential("user"), legacy],
+            Vec::new(),
+            // A route without an authenticated direct connection is not a match.
+            vec![credential_route(42, "10.252.9.2/24")],
+        );
+        assert_eq!(data.credentials[0].credential_id, "legacy");
+        assert_eq!(data.credentials[1].credential_id, "user");
+        assert!(data.credentials.iter().all(|entry| entry.peers.is_empty()));
+        assert_eq!(
+            serde_json::to_value(&data).unwrap()["credentials"][0]["peers"],
+            serde_json::json!([])
+        );
+        let table = format_credential_peers(&data);
+        assert!(table.contains("no direct peers"));
+        assert!(!table.contains("offline"));
+    }
+
+    #[test]
+    fn credential_peers_does_not_attribute_relayed_nodes_to_the_next_hop() {
+        let mut relayed = credential_route(42, "10.252.9.42/24");
+        relayed.next_hop_peer_id = 7;
+        let mut legacy = credential("legacy");
+        legacy.public_key_fingerprint.clear();
+        let data = build_credential_peers(
+            vec![credential("user"), legacy],
+            vec![credential_peer(7)],
+            vec![credential_route(7, "10.252.9.7/24"), relayed],
+        );
+        assert!(data.credentials[0].peers.is_empty());
+        let peers = &data.credentials[1].peers;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].peer_id, 7);
+        assert_eq!(peers[0].ipv4.as_deref(), Some("10.252.9.7"));
+    }
+
+    #[test]
+    fn credential_peers_keeps_connected_nodes_with_missing_route_addresses() {
+        for routes in [
+            Vec::new(),
+            vec![ApiRoute {
+                peer_id: 42,
+                ipv4_addr: Some(Default::default()),
+                ipv6_addr: Some(Default::default()),
+                ..Default::default()
+            }],
+        ] {
+            let data =
+                build_credential_peers(vec![credential("user")], vec![credential_peer(42)], routes);
+            let peer = &data.credentials[0].peers[0];
+            assert_eq!(peer.peer_id, 42);
+            assert!(peer.ipv4.is_none());
+            assert!(peer.ipv6.is_none());
+            assert_eq!(peer.hostname, "");
+            assert_eq!(
+                serde_json::to_value(&data).unwrap()["credentials"][0]["peers"][0]["ipv4"],
+                serde_json::Value::Null
+            );
+        }
+    }
+
+    #[test]
+    fn credential_peers_does_not_associate_another_credentials_key() {
+        let mut other = credential("other");
+        other.public_key_fingerprint = "0".repeat(64);
+        let data = build_credential_peers(
+            vec![other, credential("user")],
+            vec![credential_peer(42)],
+            vec![credential_route(42, "10.252.9.2/24")],
+        );
+        assert!(data.credentials[0].peers.is_empty());
+        assert_eq!(data.credentials[1].peers.len(), 1);
+    }
+
+    #[test]
+    fn credential_peers_handles_an_empty_credential_list() {
+        let data = build_credential_peers(
+            Vec::new(),
+            vec![credential_peer(42)],
+            vec![credential_route(42, "10.252.9.2/24")],
+        );
+        assert!(data.credentials.is_empty());
+        assert_eq!(format_credential_peers(&data), "No active credentials");
+    }
 
     #[test]
     fn missing_web_client_service_matches_raw_service_name() {
@@ -569,6 +1000,130 @@ mod tests {
 
         assert!(!is_missing_web_client_service(&error));
     }
+
+    #[test]
+    fn vpn_portal_client_requires_a_complete_ipv4_cidr() {
+        let client = parse_vpn_portal_client_cidr("10.90.0.2/16").unwrap();
+        assert_eq!(client.to_string(), "10.90.0.2/16");
+        assert!(parse_vpn_portal_client_cidr("10.90.0.2").is_err());
+    }
+
+    #[test]
+    fn proxy_cidrs_are_displayed_one_per_line() {
+        assert_eq!(
+            format_proxy_cidrs("10.0.0.0/24, 192.168.0.0/16"),
+            "10.0.0.0/24\n192.168.0.0/16"
+        );
+        assert_eq!(format_proxy_cidrs("10.0.0.0/24"), "10.0.0.0/24");
+        assert_eq!(format_proxy_cidrs(""), "");
+    }
+
+    #[test]
+    fn route_column_priority_preserves_proxy_cidrs() {
+        let headers = [
+            "ipv4",
+            "hostname",
+            "proxy_cidrs",
+            "next_hop_ipv4",
+            "next_hop_hostname",
+            "next_hop_lat",
+            "path_len",
+            "path_latency",
+            "next_hop_ipv4_lat_first",
+            "next_hop_hostname_lat_first",
+            "path_len_lat_first",
+            "path_latency_lat_first",
+            "version",
+        ]
+        .map(str::to_string);
+        let col_widths = headers
+            .iter()
+            .map(|header| text_width(header))
+            .collect::<Vec<_>>();
+        let drop_indices = header_indices(&headers, ROUTE_DROP_COLUMNS);
+
+        let (active, dropped, total_width) =
+            select_columns_to_drop(Some(79), &drop_indices, &col_widths);
+
+        let proxy_index = headers
+            .iter()
+            .position(|header| header == "proxy_cidrs")
+            .unwrap();
+        assert!(active[proxy_index]);
+        assert!(!dropped.contains(&proxy_index));
+        assert!(total_width <= 79);
+    }
+
+    fn parse_install_core_args(argv: &[&str]) -> Vec<OsString> {
+        let cli = Cli::try_parse_from(argv).expect("failed to parse cli");
+        let SubCommand::Service(service_args) = cli.sub_command else {
+            panic!("not a service subcommand");
+        };
+        let ServiceSubCommand::Install(install_args) = service_args.sub_command else {
+            panic!("not an install subcommand");
+        };
+        install_args.core_args.expect("no core args")
+    }
+
+    #[test]
+    fn install_core_args_do_not_include_the_flag_itself() {
+        // trailing_var_arg used to collect the "--core-args" token itself into
+        // the value, breaking the installed service's command line.
+        let args = parse_install_core_args(&[
+            "easytier-cli",
+            "service",
+            "install",
+            "--core-args",
+            "--daemon",
+            "--config-dir",
+            "/nonexistent",
+        ]);
+        assert_eq!(args, vec!["--daemon", "--config-dir", "/nonexistent"]);
+    }
+
+    #[test]
+    fn install_core_args_support_equals_form() {
+        let args = parse_install_core_args(&[
+            "easytier-cli",
+            "service",
+            "install",
+            "--core-args=--daemon",
+        ]);
+        assert_eq!(args, vec!["--daemon"]);
+    }
+
+    #[test]
+    fn install_options_before_core_args_still_parse() {
+        let cli = Cli::try_parse_from([
+            "easytier-cli",
+            "service",
+            "install",
+            "--disable-autostart",
+            "true",
+            "--core-args",
+            "--daemon",
+        ])
+        .expect("failed to parse cli");
+        let SubCommand::Service(service_args) = cli.sub_command else {
+            panic!("not a service subcommand");
+        };
+        let ServiceSubCommand::Install(install_args) = service_args.sub_command else {
+            panic!("not an install subcommand");
+        };
+        assert_eq!(install_args.disable_autostart, Some(true));
+        assert_eq!(
+            install_args.core_args.expect("no core args"),
+            vec!["--daemon"]
+        );
+    }
+}
+
+fn format_proxy_cidrs(value: &str) -> String {
+    value
+        .split(',')
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(serde::Serialize)]
@@ -1707,6 +2262,7 @@ impl<'a> CommandHandler<'a> {
         struct RouteTableItem {
             ipv4: String,
             hostname: String,
+            #[tabled(display("format_proxy_cidrs"))]
             proxy_cidrs: String,
 
             next_hop_ipv4: String,
@@ -1833,8 +2389,8 @@ impl<'a> CommandHandler<'a> {
             print_output(
                 &items,
                 self.output_format,
-                &["proxy_cidrs", "version"],
-                &["proxy_cidrs", "version"],
+                ROUTE_OPTIONAL_COLUMNS,
+                ROUTE_DROP_COLUMNS,
                 self.no_trunc,
             )
         })
@@ -1869,6 +2425,173 @@ impl<'a> CommandHandler<'a> {
             }
             Ok(())
         })
+    }
+
+    async fn apply_acl_set(&self, acl: Acl) -> Result<(), Error> {
+        // tcp_whitelist/udp_whitelist are separate config knobs that remain in
+        // effect alongside the ACL; updating them is out of scope for `acl set`.
+        let client = self.get_config_client().await?;
+        let request = PatchConfigRequest {
+            instance: Some(self.instance_selector.clone()),
+            patch: Some(InstanceConfigPatch {
+                acl: Some(AclPatch {
+                    acl: Some(acl),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let _response = client
+            .patch_config(BaseController::default(), request)
+            .await?;
+        Ok(())
+    }
+
+    async fn handle_acl_set(&self, raw: &str) -> Result<(), Error> {
+        // Load the content either from a file (`@path`) or inline.
+        let text = if let Some(path) = raw.strip_prefix('@') {
+            tokio::fs::read_to_string(path)
+                .await
+                .with_context(|| format!("failed to read ACL file `{path}`"))?
+        } else {
+            raw.to_string()
+        };
+
+        // Try parsing as JSON first, then fallback to TOML if JSON parsing fails.
+        #[derive(serde::Deserialize, Default)]
+        struct AclWrapper {
+            acl: Option<Acl>,
+        }
+
+        // Your JSON file includes a full PatchConfigRequest structure: {"instance": ..., "patch": {"acl": {"acl": ...}}}
+        // Let's support parsing full PatchConfigRequest or patch payload or Acl directly.
+        #[derive(serde::Deserialize, Default)]
+        struct PatchRequestJson {
+            patch: Option<InstanceConfigPatch>,
+        }
+
+        let acl = if let Ok(parsed_req) = serde_json::from_str::<PatchRequestJson>(&text) {
+            parsed_req
+                .patch
+                .and_then(|p| p.acl)
+                .and_then(|a| a.acl)
+                .unwrap_or_default()
+        } else if let Ok(parsed_json) = serde_json::from_str::<AclWrapper>(&text) {
+            parsed_json.acl.unwrap_or_default()
+        } else if let Ok(parsed_json_direct) = serde_json::from_str::<Acl>(&text) {
+            parsed_json_direct
+        } else {
+            // Fallback to TOML
+            #[derive(serde::Deserialize, Default)]
+            struct AclToml {
+                acl: Option<Acl>,
+            }
+            let parsed_toml: AclToml = toml::from_str(&text).with_context(
+                || "failed to parse ACL as either JSON or TOML (expected `[acl.acl_v1]` structure)",
+            )?;
+            parsed_toml.acl.unwrap_or_default()
+        };
+        if acl.is_empty() {
+            anyhow::bail!(
+                "parsed ACL is empty; provide at least one chain or a non-empty group under `[acl.acl_v1]`"
+            );
+        }
+
+        // Redact group secrets before any JSON echo so credentials are never
+        // written to stdout or captured logs (matches core's dump redaction).
+        let mut sanitized = acl.clone();
+        if let Some(group) = sanitized.acl_v1.as_mut().and_then(|v| v.group.as_mut()) {
+            for declaration in group.declares.iter_mut() {
+                if !declaration.group_secret.is_empty() {
+                    declaration.group_secret = "<redacted>".to_string();
+                }
+            }
+        }
+
+        let chain_count = acl
+            .acl_v1
+            .as_ref()
+            .map(|v| v.chains.len())
+            .unwrap_or_default();
+
+        // Apply to each selected instance, collecting per-instance outcomes so
+        // a failure on one instance does not leave others partially or
+        // silently updated.
+        let outcomes: Vec<(String, Result<(), Error>)> = match self.fanout_targets().await? {
+            Some(targets) => {
+                let mut list = Vec::with_capacity(targets.len());
+                for target in targets {
+                    let label = target.label();
+                    let scoped = self.scoped_to_instance(&target);
+                    list.push((label, scoped.apply_acl_set(acl.clone()).await));
+                }
+                list
+            }
+            None => vec![(
+                "selected instance".to_string(),
+                self.apply_acl_set(acl.clone()).await,
+            )],
+        };
+
+        let mut failures: Vec<(String, Error)> = Vec::new();
+        let mut ok = 0usize;
+        for (label, result) in outcomes {
+            match result {
+                Ok(()) => {
+                    ok += 1;
+                    if *self.output_format == OutputFormat::Json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "instance": label,
+                                "success": true,
+                                "chains": chain_count,
+                                "acl": &sanitized,
+                            }))?
+                        );
+                    } else {
+                        println!("== {} ==", label);
+                        println!("ACL updated successfully ({chain_count} chain(s))");
+                    }
+                }
+                Err(e) => {
+                    if *self.output_format == OutputFormat::Json {
+                        let _ = serde_json::to_writer(
+                            std::io::stdout(),
+                            &serde_json::json!({
+                                "instance": label,
+                                "success": false,
+                                "error": e.to_string(),
+                            }),
+                        );
+                    } else {
+                        println!("== {} ==", label);
+                        println!("ACL update failed: {e:#}");
+                    }
+                    failures.push((label, e));
+                }
+            }
+        }
+
+        if ok == 0 {
+            return Err(anyhow::anyhow!(
+                "ACL update failed on all {} selected instance(s)",
+                failures.len()
+            ));
+        }
+        if !failures.is_empty() {
+            return Err(anyhow::anyhow!(
+                "ACL update failed on {} of {} selected instance(s): {}",
+                failures.len(),
+                ok + failures.len(),
+                failures
+                    .iter()
+                    .map(|(label, _)| label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        Ok(())
     }
 
     async fn handle_mapped_listener_list(&self) -> Result<(), Error> {
@@ -2388,6 +3111,30 @@ impl<'a> CommandHandler<'a> {
         })
     }
 
+    async fn handle_credential_peers(&self) -> Result<(), Error> {
+        let results = self
+            .collect_instance_results(|handler| {
+                Box::pin(async move {
+                    let credentials = handler.fetch_credential_list().await?;
+                    let peers = handler.list_peers().await?;
+                    let routes = handler.list_routes().await?;
+                    Ok(build_credential_peers(
+                        credentials.credentials,
+                        peers.peer_infos,
+                        routes.routes,
+                    ))
+                })
+            })
+            .await?;
+        if *self.output_format == OutputFormat::Json {
+            return self.print_json_results(results);
+        }
+        self.print_results(&results, |data| {
+            println!("{}", format_credential_peers(data));
+            Ok(())
+        })
+    }
+
     async fn handle_peer_center(&self) -> Result<(), Error> {
         let results = self
             .collect_instance_results(|handler| Box::pin(handler.fetch_peer_center_rows()))
@@ -2436,6 +3183,84 @@ impl<'a> CommandHandler<'a> {
         })
     }
 
+    async fn apply_vpn_portal_client_patch(
+        &self,
+        patch: VpnPortalClientPatch,
+    ) -> Result<(), Error> {
+        let client = self.get_config_client().await?;
+        let request = PatchConfigRequest {
+            instance: Some(self.instance_selector.clone()),
+            patch: Some(InstanceConfigPatch {
+                vpn_portal_clients: vec![patch],
+                ..Default::default()
+            }),
+        };
+        let _response = client
+            .patch_config(BaseController::default(), request)
+            .await?;
+        Ok(())
+    }
+
+    async fn handle_vpn_portal_add_client(
+        &self,
+        name: String,
+        virtual_ip: String,
+        groups: Vec<String>,
+    ) -> Result<(), Error> {
+        let virtual_ip = parse_vpn_portal_client_cidr(&virtual_ip)?.to_string();
+        self.apply_to_instances(|handler| {
+            let name = name.clone();
+            let virtual_ip = virtual_ip.clone();
+            let groups = groups.clone();
+            Box::pin(async move {
+                handler
+                    .apply_vpn_portal_client_patch(VpnPortalClientPatch {
+                        action: ConfigPatchAction::Add as i32,
+                        client: Some(ManageVpnPortalClientConfig {
+                            name,
+                            virtual_ip,
+                            groups,
+                        }),
+                    })
+                    .await
+            })
+        })
+        .await
+    }
+
+    async fn handle_vpn_portal_remove_client(&self, name: String) -> Result<(), Error> {
+        self.apply_to_instances(|handler| {
+            let name = name.clone();
+            Box::pin(async move {
+                handler
+                    .apply_vpn_portal_client_patch(VpnPortalClientPatch {
+                        action: ConfigPatchAction::Remove as i32,
+                        client: Some(ManageVpnPortalClientConfig {
+                            name,
+                            virtual_ip: String::new(),
+                            groups: Vec::new(),
+                        }),
+                    })
+                    .await
+            })
+        })
+        .await
+    }
+
+    async fn handle_vpn_portal_clear_clients(&self) -> Result<(), Error> {
+        self.apply_to_instances(|handler| {
+            Box::pin(async move {
+                handler
+                    .apply_vpn_portal_client_patch(VpnPortalClientPatch {
+                        action: ConfigPatchAction::Clear as i32,
+                        client: None,
+                    })
+                    .await
+            })
+        })
+        .await
+    }
+
     async fn handle_vpn_portal(&self) -> Result<(), Error> {
         let results = self
             .collect_instance_results(|handler| Box::pin(handler.fetch_vpn_portal_info()))
@@ -2447,15 +3272,35 @@ impl<'a> CommandHandler<'a> {
 
         self.print_results(&results, |resp| {
             println!("portal_name: {}", resp.vpn_type);
-            println!(
-                r#"
-############### client_config_start ###############
-{}
-############### client_config_end ###############
-"#,
-                resp.client_config
-            );
-            println!("connected_clients:\n{:#?}", resp.connected_clients);
+            if let Some(listener) = &resp.listener {
+                println!("listener: {listener}");
+            }
+            for client in &resp.clients {
+                let state = easytier_proto::api::instance::VpnPortalClientState::try_from(
+                    client.state,
+                )
+                .map_or("UNKNOWN", |state| state.as_str_name());
+                println!(
+                    "\nclient: {}\nvirtual_ip: {}\nstate: {}\npeer_id: {}\nendpoint: {}\ntunnel_ip: {}\ngroups: {}",
+                    client.name,
+                    client.virtual_ip,
+                    state,
+                    client
+                        .peer_id
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    client.endpoint.as_deref().unwrap_or("-"),
+                    client.tunnel_ip.as_deref().unwrap_or("-"),
+                    client.groups.join(", "),
+                );
+                println!(
+                    "############### client_config_start ###############\n{}############### client_config_end ###############",
+                    client.client_config
+                );
+                if let Some(error) = &client.error {
+                    println!("error: {error}");
+                }
+            }
             Ok(())
         })
     }
@@ -2723,7 +3568,7 @@ fn apply_column_drops(table: &mut tabled::Table, drop_indices: &[usize]) {
     let mut indices = drop_indices.to_vec();
     indices.sort_unstable_by(|a, b| b.cmp(a));
     for index in indices {
-        table.with(Disable::column(Columns::single(index)));
+        table.with(Remove::column(Columns::one(index)));
     }
 }
 
@@ -2967,9 +3812,24 @@ async fn main() -> Result<(), Error> {
         SubCommand::PeerCenter => {
             handler.handle_peer_center().await?;
         }
-        SubCommand::VpnPortal => {
-            handler.handle_vpn_portal().await?;
-        }
+        SubCommand::VpnPortal(args) => match args.sub_command {
+            None => handler.handle_vpn_portal().await?,
+            Some(VpnPortalSubCommand::AddClient {
+                name,
+                virtual_ip,
+                groups,
+            }) => {
+                handler
+                    .handle_vpn_portal_add_client(name, virtual_ip, groups)
+                    .await?;
+            }
+            Some(VpnPortalSubCommand::RemoveClient { name }) => {
+                handler.handle_vpn_portal_remove_client(name).await?;
+            }
+            Some(VpnPortalSubCommand::ClearClients) => {
+                handler.handle_vpn_portal_clear_clients().await?;
+            }
+        },
         SubCommand::Node(sub_cmd) => {
             handler.handle_node(sub_cmd.sub_command.as_ref()).await?;
         }
@@ -3018,6 +3878,7 @@ async fn main() -> Result<(), Error> {
                         program: bin_path,
                         args: bin_args,
                         work_directory: work_dir,
+                        environment: None,
                         disable_autostart: install_args.disable_autostart.unwrap_or(false),
                         description: Some(install_args.description),
                         display_name: install_args.display_name,
@@ -3103,6 +3964,9 @@ async fn main() -> Result<(), Error> {
         SubCommand::Acl(acl_args) => match &acl_args.sub_command {
             Some(AclSubCommand::Stats) | None => {
                 handler.handle_acl_stats().await?;
+            }
+            Some(AclSubCommand::Set(args)) => {
+                handler.handle_acl_set(&args.acl).await?;
             }
         },
         SubCommand::PortForward(port_forward_args) => match &port_forward_args.sub_command {
@@ -3196,6 +4060,9 @@ async fn main() -> Result<(), Error> {
             }
             CredentialSubCommand::List => {
                 handler.handle_credential_list().await?;
+            }
+            CredentialSubCommand::Peers => {
+                handler.handle_credential_peers().await?;
             }
         },
         SubCommand::GenAutocomplete { shell } => {

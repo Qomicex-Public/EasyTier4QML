@@ -1,15 +1,24 @@
 //! Static configuration schema plus the live runtime configuration store.
 
-#[cfg(feature = "management")]
+#[cfg(feature = "web-client")]
 pub mod api;
-#[cfg(feature = "management")]
+#[cfg(any(feature = "web-client", feature = "browser-config"))]
 pub mod api_input;
+#[cfg(all(
+    feature = "browser-config",
+    target_arch = "wasm32",
+    target_os = "unknown"
+))]
+mod browser;
+mod dhcp;
 mod encryption;
 pub mod gateway;
 pub mod peers;
 pub mod runtime;
 pub mod toml;
 
+pub use dhcp::DhcpConfig;
+pub(crate) use dhcp::valid_ipv6_subnet;
 pub use encryption::EncryptionAlgorithm;
 
 pub(crate) const DEFAULT_UDP_STUN_SERVERS: &[&str] = &[
@@ -42,6 +51,7 @@ use std::{
 use anyhow::Context as _;
 use base64::{Engine as _, prelude::BASE64_STANDARD};
 use easytier_proto::{common as common_pb, core_config as pb};
+use optionize::Optionizable;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -113,13 +123,12 @@ pub fn normalize_secure_mode_config(
     match config.local_public_key.as_ref() {
         None => config.local_public_key = Some(generated_public_key),
         Some(configured_public_key) => {
-            let public_key = config.public_key()?;
-            let canonical_public_key = BASE64_STANDARD.encode(public_key.as_bytes());
-            if configured_public_key != &canonical_public_key {
+            config.public_key()?;
+            if configured_public_key != &generated_public_key {
                 anyhow::bail!(
                     "local public key {} does not match generated public key {}",
                     configured_public_key,
-                    canonical_public_key
+                    generated_public_key
                 );
             }
         }
@@ -275,6 +284,8 @@ pub struct ForeignNetworkConfig {
     pub cidrs: Vec<IpPrefix>,
 }
 
+#[optionize::optionized]
+#[optionize(object = pb::PeerPolicyConfig)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerPolicyConfig {
     pub p2p_enabled: bool,
@@ -517,28 +528,15 @@ impl From<ForeignNetworkConfig> for pb::ForeignNetworkConfig {
 
 impl From<pb::PeerPolicyConfig> for PeerPolicyConfig {
     fn from(value: pb::PeerPolicyConfig) -> Self {
-        let default = Self::default();
-        Self {
-            p2p_enabled: value.p2p_enabled.unwrap_or(default.p2p_enabled),
-            relay_peer_rpc: value.relay_peer_rpc.unwrap_or(default.relay_peer_rpc),
-            relay_data: value.relay_data.unwrap_or(default.relay_data),
-            latency_first: value.latency_first.unwrap_or(default.latency_first),
-            encryption_required: value
-                .encryption_required
-                .unwrap_or(default.encryption_required),
-        }
+        let mut config = Self::default();
+        config.load(value);
+        config
     }
 }
 
 impl From<PeerPolicyConfig> for pb::PeerPolicyConfig {
     fn from(value: PeerPolicyConfig) -> Self {
-        Self {
-            p2p_enabled: Some(value.p2p_enabled),
-            relay_peer_rpc: Some(value.relay_peer_rpc),
-            relay_data: Some(value.relay_data),
-            latency_first: Some(value.latency_first),
-            encryption_required: Some(value.encryption_required),
-        }
+        value.downgrade()
     }
 }
 
@@ -739,6 +737,24 @@ mod tests {
         assert_eq!(
             normalize_secure_mode_config(config.clone()).unwrap(),
             config
+        );
+    }
+
+    #[test]
+    fn secure_mode_normalization_rejects_mismatched_public_key() {
+        let private_key = StaticSecret::from([7; 32]);
+        let other_public_key = PublicKey::from(&StaticSecret::from([9; 32]));
+        let error = normalize_secure_mode_config(common_pb::SecureModeConfig {
+            enabled: true,
+            local_private_key: Some(BASE64_STANDARD.encode(private_key.as_bytes())),
+            local_public_key: Some(BASE64_STANDARD.encode(other_public_key.as_bytes())),
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("does not match generated public key"),
+            "{error}"
         );
     }
 

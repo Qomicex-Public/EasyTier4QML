@@ -66,12 +66,41 @@ export async function collectNetworkInfo(instanceId: string) {
   return await invoke<Api.CollectNetworkInfoResponse>('collect_network_info', { instanceId })
 }
 
+export async function getVpnPortalInfo(instanceId: string) {
+  const info = await invoke<NetworkTypes.VpnPortalInfo | undefined>('get_vpn_portal_info', { instanceId })
+  return info ? NetworkTypes.normalizeVpnPortalInfo(info) : undefined
+}
+
+export async function addVpnPortalClient(instanceId: string, client: { name: string, virtual_ip: string, groups: string[] }) {
+  return invoke('patch_vpn_portal_clients', { instanceId, action: 'add', name: client.name, virtualIp: client.virtual_ip, groups: client.groups })
+}
+
+export async function removeVpnPortalClient(instanceId: string, name: string) {
+  return invoke('patch_vpn_portal_clients', { instanceId, action: 'remove', name })
+}
+
+export async function clearVpnPortalClients(instanceId: string) {
+  return invoke('patch_vpn_portal_clients', { instanceId, action: 'clear' })
+}
+
 export async function setLoggingLevel(level: string) {
   return await invoke('set_logging_level', { level })
 }
 
-export async function setTunFd(fd: number) {
-  return await invoke('set_tun_fd', { fd })
+export interface MobileTunConfig {
+  instance_ids: string[]
+  addresses: string[]
+  routes: string[]
+  dns?: string | null
+  rejected: { instance_id: string, error: string }[]
+}
+
+export async function getMobileTunConfig(instanceIds: string[]) {
+  return await invoke<MobileTunConfig>('get_mobile_tun_config', { instanceIds })
+}
+
+export async function setTunFd(fd: number, instanceIds?: string[]) {
+  return await invoke<MobileTunConfig>('set_tun_fd', { fd, instanceIds })
 }
 
 export async function getEasytierVersion() {
@@ -110,7 +139,7 @@ export async function sendConfigs(enabledNetworks: string[]) {
       config: NetworkTypes.toBackendNetworkConfig(config),
       source,
     })),
-    enabledNetworks
+    enabledNetworks,
   })
 }
 

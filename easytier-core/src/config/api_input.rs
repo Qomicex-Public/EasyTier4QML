@@ -3,13 +3,20 @@
 use std::net::SocketAddr;
 
 use anyhow::Context;
-use easytier_proto::api::manage;
+use easytier_proto::{api::manage, common::FlagsPatch};
+
+#[cfg(all(
+    feature = "browser-config",
+    any(test, all(target_arch = "wasm32", target_os = "unknown"))
+))]
+use easytier_proto::common::Flags;
+use optionize::{Optionizable, Optionized};
 
 use crate::config::{
     MappedListenerPolicy, normalize_secure_mode_config,
     toml::{
         ConfigLoader, NetworkIdentity, PeerConfig, PortForwardConfig, TomlConfigLoader,
-        VpnPortalConfig, gen_default_flags,
+        VpnPortalClientConfig, VpnPortalConfig,
     },
 };
 
@@ -51,9 +58,144 @@ pub fn add_proxy_network_to_config(
 pub type NetworkingMethod = easytier_proto::api::manage::NetworkingMethod;
 pub type NetworkConfig = easytier_proto::api::manage::NetworkConfig;
 
+pub(crate) fn set_network_flags(result: &mut NetworkConfig, flags: FlagsPatch) {
+    result.latency_first = flags.latency_first;
+    result.dev_name = flags.dev_name;
+    result.use_smoltcp = flags.use_smoltcp;
+    result.disable_ipv6 = flags.enable_ipv6.map(|enabled| !enabled);
+    result.enable_kcp_proxy = flags.enable_kcp_proxy;
+    result.disable_kcp_input = flags.disable_kcp_input;
+    result.enable_quic_proxy = flags.enable_quic_proxy;
+    result.disable_quic_input = flags.disable_quic_input;
+    result.disable_p2p = flags.disable_p2p;
+    result.p2p_only = flags.p2p_only;
+    result.lazy_p2p = flags.lazy_p2p;
+    result.bind_device = flags.bind_device;
+    result.socket_mark = flags.socket_mark;
+    result.no_tun = flags.no_tun;
+    result.enable_exit_node = flags.enable_exit_node;
+    result.relay_all_peer_rpc = flags.relay_all_peer_rpc;
+    result.need_p2p = flags.need_p2p;
+    result.multi_thread = flags.multi_thread;
+    result.proxy_forward_by_system = flags.proxy_forward_by_system;
+    result.disable_encryption = flags.enable_encryption.map(|enabled| !enabled);
+    result.disable_tcp_hole_punching = flags.disable_tcp_hole_punching;
+    result.disable_udp_hole_punching = flags.disable_udp_hole_punching;
+    result.disable_upnp = flags.disable_upnp;
+    result.disable_relay_data = flags.disable_relay_data;
+    result.prefer_peer_relay = flags.prefer_peer_relay;
+    result.enable_udp_broadcast_relay = flags.enable_udp_broadcast_relay;
+    result.disable_sym_hole_punching = flags.disable_sym_hole_punching;
+    result.enable_magic_dns = flags.accept_dns;
+    result.mtu = flags.mtu.map(|mtu| mtu as i32);
+    result.data_compress_algo = flags.data_compress_algo;
+    result.encryption_algorithm = flags.encryption_algorithm;
+    result.instance_recv_bps_limit = flags.instance_recv_bps_limit;
+    result.enable_private_mode = flags.private_mode;
+
+    result.enable_relay_network_whitelist = flags
+        .relay_network_whitelist
+        .as_ref()
+        .map(|list| list != "*");
+    result.relay_network_whitelist = flags
+        .relay_network_whitelist
+        .filter(|list| list != "*")
+        .map(|list| list.split_whitespace().map(ToOwned::to_owned).collect())
+        .unwrap_or_default();
+}
+
 pub trait NetworkConfigExt {
     fn gen_config(&self) -> Result<TomlConfigLoader, anyhow::Error>;
     fn new_from_config(config: impl ConfigLoader) -> Result<NetworkConfig, anyhow::Error>;
+}
+
+#[cfg(all(
+    feature = "browser-config",
+    any(test, all(target_arch = "wasm32", target_os = "unknown"))
+))]
+const FORM_MANAGED_TOML_FIELDS: &[&str] = &[
+    "hostname",
+    "instance_id",
+    "ipv4",
+    "ipv6_public_addr_provider",
+    "ipv6_public_addr_auto",
+    "ipv6_public_addr_prefix",
+    "dhcp",
+    "dhcpv6",
+    "network_identity",
+    "listeners",
+    "mapped_listeners",
+    "exit_nodes",
+    "peer",
+    "proxy_network",
+    "vpn_portal_config",
+    "routes",
+    "socks5_proxy",
+    "port_forward",
+    "secure_mode",
+    "acl",
+    "credential_file",
+    "managed_credentials",
+];
+
+#[cfg(all(
+    feature = "browser-config",
+    any(test, all(target_arch = "wasm32", target_os = "unknown"))
+))]
+pub(crate) fn merge_network_config_toml(
+    original_toml: &str,
+    config: &NetworkConfig,
+) -> Result<String, anyhow::Error> {
+    let generated_toml = config.gen_config()?.dump();
+    let mut original = toml::from_str::<toml::Table>(original_toml)
+        .context("failed to parse the original TOML document")?;
+    let mut generated = toml::from_str::<toml::Table>(&generated_toml)
+        .context("failed to parse the generated TOML document")?;
+
+    for (key, value) in original.iter() {
+        if key != "flags" && !FORM_MANAGED_TOML_FIELDS.contains(&key.as_str()) {
+            generated.insert(key.clone(), value.clone());
+        }
+    }
+    if !original.contains_key("instance_name") {
+        generated.remove("instance_name");
+    }
+
+    let mut merged_flags: toml::Table = original
+        .remove("flags")
+        .and_then(|value| value.try_into().ok())
+        .unwrap_or_default();
+    let generated_flags: toml::Table = generated
+        .remove("flags")
+        .and_then(|value| value.try_into().ok())
+        .unwrap_or_default();
+
+    // Normalize any camelCase aliases in original [flags] to their canonical field names
+    // so each field appears at most once in the merged table.
+    for field in Flags::flags() {
+        if let (Some(name), Some(json_name)) = (field.name.as_deref(), field.json_name.as_deref()) {
+            if name != json_name
+                && let Some(val) = merged_flags.remove(json_name)
+            {
+                merged_flags.entry(name.to_owned()).or_insert(val);
+            }
+        }
+    }
+
+    // The keys a config form owns are the flags it offers a control for, which
+    // the schema declares with `(easytier.flag)`.
+    for key in Flags::form() {
+        if let Some(value) = generated_flags.get(*key) {
+            merged_flags.insert((*key).to_owned(), value.clone());
+        } else {
+            merged_flags.remove(*key);
+        }
+    }
+    if !merged_flags.is_empty() {
+        generated.insert("flags".to_owned(), toml::Value::Table(merged_flags));
+    }
+
+    toml::to_string_pretty(&generated).context("failed to serialize the merged TOML document")
 }
 
 fn parse_peer(peer: &manage::NetworkPeerConfig) -> Result<Option<PeerConfig>, anyhow::Error> {
@@ -98,6 +240,7 @@ fn parse_peer_urls(peer_urls: &[String]) -> Result<Vec<PeerConfig>, anyhow::Erro
 }
 
 impl NetworkConfigExt for NetworkConfig {
+    #[allow(deprecated)]
     fn gen_config(&self) -> Result<TomlConfigLoader, anyhow::Error> {
         let cfg = TomlConfigLoader::default();
         cfg.set_id(
@@ -108,7 +251,18 @@ impl NetworkConfigExt for NetworkConfig {
                 .with_context(|| format!("failed to parse instance id: {:?}", self.instance_id))?,
         );
         cfg.set_hostname(self.hostname.clone());
-        cfg.set_dhcp(self.dhcp.unwrap_or_default());
+        cfg.set_dhcp(self.dhcp.unwrap_or(self.dhcp_ipv4_cidr.is_some()));
+        if cfg.get_dhcp()
+            && let Some(cidr) = &self.dhcp_ipv4_cidr
+        {
+            cfg.set_dhcp_config(super::DhcpConfig::from_cidr(cidr)?);
+        }
+        cfg.set_dhcpv6(self.dhcpv6.unwrap_or(self.dhcp_ipv6_cidr.is_some()));
+        if cfg.get_dhcpv6()
+            && let Some(cidr) = &self.dhcp_ipv6_cidr
+        {
+            cfg.set_dhcpv6_config(super::DhcpConfig::from_cidr(cidr)?);
+        }
         cfg.set_inst_name(self.network_name.clone().unwrap_or_default());
 
         // The web UI does not expose credential inputs directly, but imported/saved
@@ -219,29 +373,38 @@ impl NetworkConfigExt for NetworkConfig {
             );
         }
 
-        if self.enable_vpn_portal.unwrap_or_default() {
-            let cidr = format!(
-                "{}/{}",
-                self.vpn_portal_client_network_addr
-                    .clone()
-                    .unwrap_or_default(),
-                self.vpn_portal_client_network_len.unwrap_or(24)
+        if self.enable_vpn_portal == Some(true) {
+            anyhow::bail!(
+                "legacy VPN portal configuration is no longer supported; configure vpn_portal_config with named clients"
             );
+        }
+
+        if let Some(vpn_config) = &self.vpn_portal_config {
             cfg.set_vpn_portal_config(VpnPortalConfig {
-                client_cidr: cidr
-                    .parse()
-                    .with_context(|| format!("failed to parse vpn portal client cidr: {}", cidr))?,
-                wireguard_listen: format!(
-                    "0.0.0.0:{}",
-                    self.vpn_portal_listen_port.unwrap_or_default()
-                )
-                .parse()
-                .with_context(|| {
+                enabled: vpn_config.enabled,
+                wireguard_listen: vpn_config.wireguard_listen.parse().with_context(|| {
                     format!(
-                        "failed to parse vpn portal wireguard listen port. {:?}",
-                        self.vpn_portal_listen_port
+                        "failed to parse vpn portal wireguard listen address: {}",
+                        vpn_config.wireguard_listen
                     )
                 })?,
+                wireguard_private_key: vpn_config.wireguard_private_key.clone(),
+                clients: vpn_config
+                    .clients
+                    .iter()
+                    .map(|client| {
+                        Ok(VpnPortalClientConfig {
+                            name: client.name.clone(),
+                            virtual_ip: client.virtual_ip.parse().with_context(|| {
+                                format!(
+                                    "failed to parse vpn portal virtual IP for client {}: {}",
+                                    client.name, client.virtual_ip
+                                )
+                            })?,
+                            groups: client.groups.clone(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, anyhow::Error>>()?,
             });
         }
 
@@ -289,6 +452,13 @@ impl NetworkConfigExt for NetworkConfig {
             cfg.set_credential_file(Some(credential_file.into()));
         }
 
+        cfg.set_managed_credentials(
+            self.managed_credentials
+                .iter()
+                .map(|credential| credential.clone().upgrade())
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+
         if let Some(credential_secret) = credential_secret {
             cfg.set_secure_mode(Some(normalize_secure_mode_config(
                 easytier_proto::common::SecureModeConfig {
@@ -304,19 +474,6 @@ impl NetworkConfigExt for NetworkConfig {
                     .map(normalize_secure_mode_config)
                     .transpose()?,
             );
-        }
-
-        let mut flags = gen_default_flags();
-        if let Some(latency_first) = self.latency_first {
-            flags.latency_first = latency_first;
-        }
-
-        if let Some(dev_name) = self.dev_name.clone() {
-            flags.dev_name = dev_name;
-        }
-
-        if let Some(use_smoltcp) = self.use_smoltcp {
-            flags.use_smoltcp = use_smoltcp;
         }
 
         if let Some(ipv6_public_addr_provider) = self.ipv6_public_addr_provider {
@@ -337,141 +494,59 @@ impl NetworkConfigExt for NetworkConfig {
             )?));
         }
 
-        if let Some(disable_ipv6) = self.disable_ipv6 {
-            flags.enable_ipv6 = !disable_ipv6;
-        }
-
-        if let Some(enable_kcp_proxy) = self.enable_kcp_proxy {
-            flags.enable_kcp_proxy = enable_kcp_proxy;
-        }
-
-        if let Some(disable_kcp_input) = self.disable_kcp_input {
-            flags.disable_kcp_input = disable_kcp_input;
-        }
-
-        if let Some(enable_quic_proxy) = self.enable_quic_proxy {
-            flags.enable_quic_proxy = enable_quic_proxy;
-        }
-
-        if let Some(disable_quic_input) = self.disable_quic_input {
-            flags.disable_quic_input = disable_quic_input;
-        }
-
-        if let Some(disable_p2p) = self.disable_p2p {
-            flags.disable_p2p = disable_p2p;
-        }
-
-        if let Some(p2p_only) = self.p2p_only {
-            flags.p2p_only = p2p_only;
-        }
-
-        if let Some(lazy_p2p) = self.lazy_p2p {
-            flags.lazy_p2p = lazy_p2p;
-        }
-
-        if let Some(bind_device) = self.bind_device {
-            flags.bind_device = bind_device;
-        }
-
-        if self.socket_mark.is_some() {
-            flags.socket_mark = self.socket_mark;
-        }
-
-        if let Some(no_tun) = self.no_tun {
-            flags.no_tun = no_tun;
-        }
-
-        if let Some(enable_exit_node) = self.enable_exit_node {
-            flags.enable_exit_node = enable_exit_node;
-        }
-
-        if let Some(relay_all_peer_rpc) = self.relay_all_peer_rpc {
-            flags.relay_all_peer_rpc = relay_all_peer_rpc;
-        }
-
-        if let Some(need_p2p) = self.need_p2p {
-            flags.need_p2p = need_p2p;
-        }
-
-        if let Some(multi_thread) = self.multi_thread {
-            flags.multi_thread = multi_thread;
-        }
-
-        if let Some(proxy_forward_by_system) = self.proxy_forward_by_system {
-            flags.proxy_forward_by_system = proxy_forward_by_system;
-        }
-
-        if let Some(disable_encryption) = self.disable_encryption {
-            flags.enable_encryption = !disable_encryption;
-        }
-
-        if self.enable_relay_network_whitelist.unwrap_or_default() {
-            if !self.relay_network_whitelist.is_empty() {
-                flags.relay_network_whitelist = self.relay_network_whitelist.join(" ");
-            } else {
-                flags.relay_network_whitelist = "".to_string();
-            }
-        }
-
-        if let Some(disable_tcp_hole_punching) = self.disable_tcp_hole_punching {
-            flags.disable_tcp_hole_punching = disable_tcp_hole_punching;
-        }
-
-        if let Some(disable_udp_hole_punching) = self.disable_udp_hole_punching {
-            flags.disable_udp_hole_punching = disable_udp_hole_punching;
-        }
-
-        if let Some(disable_upnp) = self.disable_upnp {
-            flags.disable_upnp = disable_upnp;
-        }
-
-        if let Some(disable_relay_data) = self.disable_relay_data {
-            flags.disable_relay_data = disable_relay_data;
-        }
-
-        if let Some(enable_udp_broadcast_relay) = self.enable_udp_broadcast_relay {
-            flags.enable_udp_broadcast_relay = enable_udp_broadcast_relay;
-        }
-
-        if let Some(disable_sym_hole_punching) = self.disable_sym_hole_punching {
-            flags.disable_sym_hole_punching = disable_sym_hole_punching;
-        }
-
-        if let Some(enable_magic_dns) = self.enable_magic_dns {
-            flags.accept_dns = enable_magic_dns;
-        }
-
-        if let Some(mtu) = self.mtu {
-            flags.mtu = mtu as u32;
-        }
-
-        if let Some(instance_recv_bps_limit) = self.instance_recv_bps_limit {
-            flags.instance_recv_bps_limit = instance_recv_bps_limit;
-        }
-
-        if let Some(enable_private_mode) = self.enable_private_mode {
-            flags.private_mode = enable_private_mode;
-        }
-
-        if let Some(encryption_algorithm) = self.encryption_algorithm.clone() {
-            flags.encryption_algorithm = encryption_algorithm;
-        }
-
         if let Some(acl) = self.acl.as_ref()
             && !acl.is_empty()
         {
             cfg.set_acl(Some(acl.clone()));
         }
 
-        if let Some(data_compress_algo) = self.data_compress_algo {
-            if data_compress_algo < 1 {
-                flags.data_compress_algo = 1;
-            } else {
-                flags.data_compress_algo = data_compress_algo
-            }
-        }
-
-        cfg.set_flags(flags);
+        cfg.patch_flags(FlagsPatch {
+            dev_name: self.dev_name.clone(),
+            enable_ipv6: self.disable_ipv6.map(|disabled| !disabled),
+            socket_mark: self.socket_mark,
+            enable_encryption: self.disable_encryption.map(|disabled| !disabled),
+            relay_network_whitelist: self.enable_relay_network_whitelist.map(|enabled| {
+                if enabled {
+                    self.relay_network_whitelist.join(" ")
+                } else {
+                    "*".to_owned()
+                }
+            }),
+            accept_dns: self.enable_magic_dns,
+            mtu: self
+                .mtu
+                .map(u32::try_from)
+                .transpose()
+                .context("invalid mtu: expected a non-negative integer")?,
+            private_mode: self.enable_private_mode,
+            encryption_algorithm: self.encryption_algorithm.clone(),
+            data_compress_algo: self.data_compress_algo.map(|algorithm| algorithm.max(1)),
+            latency_first: self.latency_first,
+            use_smoltcp: self.use_smoltcp,
+            enable_kcp_proxy: self.enable_kcp_proxy,
+            disable_kcp_input: self.disable_kcp_input,
+            enable_quic_proxy: self.enable_quic_proxy,
+            disable_quic_input: self.disable_quic_input,
+            disable_p2p: self.disable_p2p,
+            p2p_only: self.p2p_only,
+            lazy_p2p: self.lazy_p2p,
+            bind_device: self.bind_device,
+            no_tun: self.no_tun,
+            enable_exit_node: self.enable_exit_node,
+            relay_all_peer_rpc: self.relay_all_peer_rpc,
+            need_p2p: self.need_p2p,
+            multi_thread: self.multi_thread,
+            proxy_forward_by_system: self.proxy_forward_by_system,
+            disable_tcp_hole_punching: self.disable_tcp_hole_punching,
+            disable_udp_hole_punching: self.disable_udp_hole_punching,
+            disable_upnp: self.disable_upnp,
+            disable_relay_data: self.disable_relay_data,
+            prefer_peer_relay: self.prefer_peer_relay,
+            enable_udp_broadcast_relay: self.enable_udp_broadcast_relay,
+            disable_sym_hole_punching: self.disable_sym_hole_punching,
+            instance_recv_bps_limit: self.instance_recv_bps_limit,
+            ..Default::default()
+        });
         Ok(cfg)
     }
 
@@ -488,6 +563,12 @@ impl NetworkConfigExt for NetworkConfig {
         }
 
         result.dhcp = Some(config.get_dhcp());
+        result.dhcp_ipv4_cidr = config.get_dhcp_config().cidr().map(|cidr| cidr.to_string());
+        result.dhcpv6 = Some(config.get_dhcpv6());
+        result.dhcp_ipv6_cidr = config
+            .get_dhcpv6_config()
+            .cidr()
+            .map(|cidr| cidr.to_string());
 
         let network_identity = config.get_network_identity();
         result.network_name = Some(network_identity.network_name.clone());
@@ -556,18 +637,23 @@ impl NetworkConfigExt for NetworkConfig {
         }
 
         if let Some(vpn_config) = config.get_vpn_portal_config() {
-            result.enable_vpn_portal = Some(true);
-
-            let cidr = vpn_config.client_cidr;
-            result.vpn_portal_client_network_addr = Some(cidr.first_address().to_string());
-            result.vpn_portal_client_network_len = Some(cidr.network_length() as i32);
-
-            result.vpn_portal_listen_port = Some(vpn_config.wireguard_listen.port() as i32);
+            result.vpn_portal_config = Some(manage::VpnPortalConfig {
+                enabled: vpn_config.enabled,
+                wireguard_listen: vpn_config.wireguard_listen.to_string(),
+                wireguard_private_key: vpn_config.wireguard_private_key,
+                clients: vpn_config
+                    .clients
+                    .into_iter()
+                    .map(|client| manage::VpnPortalClientConfig {
+                        name: client.name,
+                        virtual_ip: client.virtual_ip.to_string(),
+                        groups: client.groups,
+                    })
+                    .collect(),
+            });
         }
 
-        if let Some(routes) = config.get_routes()
-            && !routes.is_empty()
-        {
+        if let Some(routes) = config.get_routes() {
             result.enable_manual_routes = Some(true);
             result.routes = routes.iter().map(|r| r.to_string()).collect();
         }
@@ -591,62 +677,519 @@ impl NetworkConfigExt for NetworkConfig {
         result.credential_file = config
             .get_credential_file()
             .map(|path| path.to_string_lossy().into_owned());
-        let flags = config.get_flags();
-        let default_flags = default_config.get_flags();
-        result.latency_first = Some(flags.latency_first);
-        result.dev_name = Some(flags.dev_name.clone());
-        result.use_smoltcp = Some(flags.use_smoltcp);
-        result.disable_ipv6 = Some(!flags.enable_ipv6);
-        result.enable_kcp_proxy = Some(flags.enable_kcp_proxy);
-        result.disable_kcp_input = Some(flags.disable_kcp_input);
-        result.enable_quic_proxy = Some(flags.enable_quic_proxy);
-        result.disable_quic_input = Some(flags.disable_quic_input);
-        result.disable_p2p = Some(flags.disable_p2p);
-        result.p2p_only = Some(flags.p2p_only);
-        result.lazy_p2p = Some(flags.lazy_p2p);
-        result.bind_device = Some(flags.bind_device);
-        result.socket_mark = flags.socket_mark;
-        result.no_tun = Some(flags.no_tun);
-        result.enable_exit_node = Some(flags.enable_exit_node);
-        result.relay_all_peer_rpc = Some(flags.relay_all_peer_rpc);
-        result.need_p2p = Some(flags.need_p2p);
-        result.multi_thread = Some(flags.multi_thread);
-        result.proxy_forward_by_system = Some(flags.proxy_forward_by_system);
-        result.disable_encryption = Some(!flags.enable_encryption);
-        result.disable_tcp_hole_punching = Some(flags.disable_tcp_hole_punching);
-        result.disable_udp_hole_punching = Some(flags.disable_udp_hole_punching);
-        result.disable_upnp = Some(flags.disable_upnp);
-        result.disable_relay_data = Some(flags.disable_relay_data);
-        result.enable_udp_broadcast_relay = Some(flags.enable_udp_broadcast_relay);
-        result.disable_sym_hole_punching = Some(flags.disable_sym_hole_punching);
-        result.enable_magic_dns = Some(flags.accept_dns);
-        result.mtu = Some(flags.mtu as i32);
-        result.data_compress_algo = (flags.data_compress_algo != default_flags.data_compress_algo)
-            .then_some(flags.data_compress_algo);
-        result.encryption_algorithm = (flags.encryption_algorithm
-            != default_flags.encryption_algorithm)
-            .then_some(flags.encryption_algorithm.clone());
-        result.instance_recv_bps_limit =
-            (flags.instance_recv_bps_limit != u64::MAX).then_some(flags.instance_recv_bps_limit);
-        result.enable_private_mode = Some(flags.private_mode);
-
+        result.managed_credentials = config
+            .get_managed_credentials()
+            .into_iter()
+            .map(|credential| credential.downgrade())
+            .collect();
+        set_network_flags(&mut result, config.get_flags_patch());
         result.acl = config.get_acl();
 
-        if flags.relay_network_whitelist == "*" {
-            result.enable_relay_network_whitelist = Some(false);
-        } else {
-            result.enable_relay_network_whitelist = Some(true);
-            if flags.relay_network_whitelist.is_empty() {
-                result.relay_network_whitelist = vec![];
-            } else {
-                result.relay_network_whitelist = flags
-                    .relay_network_whitelist
-                    .split_whitespace()
-                    .map(|s| s.to_string())
-                    .collect();
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(deprecated)]
+
+    use super::*;
+    use easytier_proto::common::Flags;
+
+    fn api_portal_config() -> manage::VpnPortalConfig {
+        manage::VpnPortalConfig {
+            enabled: None,
+            wireguard_listen: "0.0.0.0:51820".to_owned(),
+            wireguard_private_key: Some("server-private-key".to_owned()),
+            clients: vec![manage::VpnPortalClientConfig {
+                name: "alice".to_owned(),
+                virtual_ip: "10.144.144.10/16".to_owned(),
+                groups: vec!["staff".to_owned()],
+            }],
+        }
+    }
+
+    fn standalone_config() -> NetworkConfig {
+        NetworkConfig {
+            networking_method: Some(NetworkingMethod::Standalone as i32),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn manual_routes_preserve_empty_and_automatic_modes() {
+        for routes in [Vec::new(), vec!["10.20.0.0/24".to_owned()]] {
+            for enabled in [None, Some(false), Some(true)] {
+                let mut input = standalone_config();
+                input.enable_manual_routes = enabled;
+                input.routes = routes.clone();
+                let config = input.gen_config().unwrap();
+                let expected = if enabled == Some(true) {
+                    Some(routes.iter().map(|route| route.parse().unwrap()).collect())
+                } else {
+                    None
+                };
+                assert_eq!(config.get_routes(), expected);
+                let readback = NetworkConfig::new_from_config(config.clone()).unwrap();
+                assert_eq!(
+                    readback.enable_manual_routes,
+                    enabled.filter(|value| *value)
+                );
+                assert_eq!(readback.gen_config().unwrap().get_routes(), expected);
+                assert_eq!(
+                    TomlConfigLoader::new_from_str(&config.dump())
+                        .unwrap()
+                        .get_routes(),
+                    expected
+                );
+                #[cfg(feature = "web-client")]
+                {
+                    let projected = super::super::api::network_config_from_toml(&config);
+                    assert_eq!(
+                        projected.enable_manual_routes,
+                        readback.enable_manual_routes
+                    );
+                    assert_eq!(projected.routes, readback.routes);
+                }
             }
         }
+    }
 
-        Ok(result)
+    #[test]
+    fn dhcp_cidr_survives_api_and_toml_round_trips() {
+        let mut input = standalone_config();
+        input.dhcp_ipv4_cidr = Some("192.168.100.0/24".to_owned());
+        for enabled in [None, Some(true), Some(false)] {
+            input.dhcp = enabled;
+            let config = input.gen_config().unwrap();
+            assert_eq!(config.get_dhcp(), enabled.unwrap_or(true));
+            let readback = NetworkConfig::new_from_config(config.clone()).unwrap();
+            let expected_cidr = if enabled == Some(false) {
+                None
+            } else {
+                input.dhcp_ipv4_cidr.clone()
+            };
+            assert_eq!(readback.dhcp_ipv4_cidr, expected_cidr);
+            assert_eq!(
+                TomlConfigLoader::new_from_str(&config.dump())
+                    .unwrap()
+                    .get_dhcp_config(),
+                readback.gen_config().unwrap().get_dhcp_config()
+            );
+            #[cfg(feature = "web-client")]
+            assert_eq!(
+                super::super::api::network_config_from_toml(&config).dhcp_ipv4_cidr,
+                expected_cidr
+            );
+        }
+    }
+
+    #[test]
+    fn dhcpv6_cidr_survives_management_round_trips() {
+        let mut input = NetworkConfig {
+            dhcp: Some(true),
+            dhcp_ipv6_cidr: Some("fd12::/64".to_owned()),
+            ..standalone_config()
+        };
+        for enabled in [None, Some(true), Some(false)] {
+            input.dhcpv6 = enabled;
+            let config = input.gen_config().unwrap();
+            assert_eq!(config.get_dhcpv6(), enabled.unwrap_or(true));
+            let readback = NetworkConfig::new_from_config(&config).unwrap();
+            assert_eq!(readback.dhcpv6, Some(enabled.unwrap_or(true)));
+            assert_eq!(
+                readback.dhcp_ipv6_cidr,
+                if enabled == Some(false) {
+                    None
+                } else {
+                    input.dhcp_ipv6_cidr.clone()
+                }
+            );
+            assert_eq!(
+                readback.gen_config().unwrap().get_dhcpv6_config(),
+                config.get_dhcpv6_config()
+            );
+            assert_eq!(
+                super::super::api::network_config_from_toml(&config).dhcp_ipv6_cidr,
+                readback.dhcp_ipv6_cidr
+            );
+        }
+    }
+
+    #[test]
+    fn dhcp_api_rejects_invalid_or_unusable_subnets() {
+        let mut input = standalone_config();
+        for value in [
+            "true",
+            "false",
+            "yes",
+            "::/64",
+            "192.168.100.0/31",
+            "192.168.100.1/32",
+        ] {
+            input.dhcp_ipv4_cidr = Some(value.to_owned());
+            assert!(input.gen_config().is_err(), "accepted {value}");
+        }
+    }
+
+    /// The management API's name for a flag is the schema's to state, and the
+    /// projection is what actually names the fields. Turning the flag the
+    /// annotation names must turn the field it points at, in the direction the
+    /// annotation declares.
+    #[test]
+    fn declared_api_names_match_the_projection() {
+        use prost_reflect::{DescriptorPool, Value};
+
+        let pool = DescriptorPool::decode(easytier_proto::ALL_DESCRIPTOR_BYTES).unwrap();
+        let flags = pool.get_message_by_name("common.Flags").unwrap();
+        let extension = pool.get_extension_by_name("easytier.flag").unwrap();
+
+        // A patch states every field, so the values survive serialization:
+        // protobuf JSON omits a field holding its zero value.
+        let patch: FlagsPatch = Flags::defaults().downgrade();
+        let defaults = serde_json::to_value(&patch).unwrap();
+
+        for field in flags.fields() {
+            let name = field.name();
+            let options = field.options();
+            let annotation = options.get_extension(&extension).into_owned();
+            let Value::Message(meta) = annotation else {
+                panic!("{name}: the annotation is not a message");
+            };
+            if !meta.has_field_by_name("api") {
+                continue;
+            }
+            let Value::Message(spelling) = meta.get_field_by_name("api").unwrap().into_owned()
+            else {
+                panic!("{name}: the api spelling is not a message");
+            };
+            let api_field = match spelling.get_field_by_name("field").as_deref() {
+                Some(Value::String(api_field)) if !api_field.is_empty() => api_field.clone(),
+                _ => continue,
+            };
+            let negate = matches!(
+                spelling.get_field_by_name("negate").as_deref(),
+                Some(Value::Bool(true))
+            );
+
+            let declared = defaults[name]
+                .as_bool()
+                .unwrap_or_else(|| panic!("{name} is not a boolean flag"));
+
+            let mut flipped = defaults.clone();
+            flipped[name] = serde_json::json!(!declared);
+            let patch: FlagsPatch = serde_json::from_value(flipped).unwrap();
+
+            let mut projected = NetworkConfig::default();
+            set_network_flags(&mut projected, patch);
+
+            // Protobuf JSON omits a field holding its zero value.
+            let projected = serde_json::to_value(&projected).unwrap();
+            let value = projected[&api_field].as_bool().unwrap_or(false);
+            assert_eq!(
+                value,
+                if negate { declared } else { !declared },
+                "flipping {name} should leave {api_field} as the annotation declares"
+            );
+        }
+    }
+
+    #[cfg(feature = "config-write")]
+    #[test]
+    fn api_flags_round_trip_preserves_missing_default_and_custom_values() {
+        for disabled in [None, Some(false), Some(true)] {
+            for whitelist in [None, Some(false), Some(true)] {
+                let input = NetworkConfig {
+                    disable_encryption: disabled,
+                    enable_relay_network_whitelist: whitelist,
+                    latency_first: Some(false),
+                    mtu: Some(0),
+                    instance_recv_bps_limit: Some(u64::MAX),
+                    ..standalone_config()
+                };
+                let config = input.gen_config().unwrap();
+                let config = TomlConfigLoader::new_from_str(&config.dump()).unwrap();
+                let output = NetworkConfig::new_from_config(&config).unwrap();
+                assert_eq!(output.disable_encryption, disabled);
+                assert_eq!(output.enable_relay_network_whitelist, whitelist);
+                assert_eq!(output.latency_first, Some(false));
+                assert_eq!(output.mtu, Some(0));
+                assert_eq!(output.instance_recv_bps_limit, Some(u64::MAX));
+                assert_eq!(output.disable_ipv6, None);
+                assert_eq!(output.encryption_algorithm, None);
+            }
+        }
+        assert!(
+            NetworkConfig {
+                mtu: Some(-1),
+                ..standalone_config()
+            }
+            .gen_config()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn vpn_portal_api_config_round_trips_through_toml_model() {
+        let input = NetworkConfig {
+            vpn_portal_config: Some(api_portal_config()),
+            ..standalone_config()
+        };
+
+        let config = input.gen_config().unwrap();
+        let portal = config.get_vpn_portal_config().unwrap();
+        assert_eq!(portal.wireguard_listen, "0.0.0.0:51820".parse().unwrap());
+        assert_eq!(
+            portal.wireguard_private_key.as_deref(),
+            Some("server-private-key")
+        );
+        assert_eq!(portal.clients[0].name, "alice");
+        assert_eq!(portal.clients[0].virtual_ip.to_string(), "10.144.144.10/16");
+        assert_eq!(portal.clients[0].groups, vec!["staff".to_owned()]);
+
+        let output = NetworkConfig::new_from_config(&config).unwrap();
+        assert_eq!(output.vpn_portal_config, input.vpn_portal_config);
+        assert_eq!(output.enable_vpn_portal, None);
+    }
+
+    #[test]
+    fn disabled_vpn_portal_preserves_clients_and_key_without_a_runtime() {
+        let mut portal = api_portal_config();
+        portal.enabled = Some(false);
+        let input = NetworkConfig {
+            vpn_portal_config: Some(portal),
+            ..standalone_config()
+        };
+        let config = input.gen_config().unwrap();
+        let restored = crate::config::toml::TomlConfig::new_from_str(&config.dump()).unwrap();
+        let output = NetworkConfig::new_from_config(&restored).unwrap();
+        assert_eq!(output.vpn_portal_config, input.vpn_portal_config);
+        assert!(
+            crate::instance::CoreInstanceConfig::from_toml(&restored)
+                .unwrap()
+                .vpn_portal
+                .is_none()
+        );
+
+        let mut portal = restored.get_vpn_portal_config().unwrap();
+        portal.enabled = Some(true);
+        restored.set_vpn_portal_config(portal);
+        let runtime = crate::instance::CoreInstanceConfig::from_toml(&restored).unwrap();
+        assert_eq!(runtime.vpn_portal.unwrap().clients[0].name, "alice");
+    }
+
+    #[test]
+    fn managed_credentials_round_trip_through_toml_model() {
+        let input = NetworkConfig {
+            managed_credentials: vec![manage::ManagedCredentialConfig {
+                credential_id: "managed-a".to_owned(),
+                credential_secret: "secret".to_owned(),
+                groups: vec!["ops".to_owned()],
+                allow_relay: true,
+                allowed_proxy_cidrs: vec!["10.0.0.0/24".to_owned()],
+                expiry_unix: 2_000_000_000,
+                reusable: None,
+            }],
+            ..standalone_config()
+        };
+
+        let config = input.gen_config().unwrap();
+        let output = NetworkConfig::new_from_config(&config).unwrap();
+        assert_eq!(output.managed_credentials[0].credential_id, "managed-a");
+        assert_eq!(output.managed_credentials[0].reusable, Some(true));
+    }
+
+    #[test]
+    fn peer_relay_preference_round_trips_independently() {
+        let input = NetworkConfig {
+            disable_relay_data: Some(false),
+            prefer_peer_relay: Some(true),
+            ..standalone_config()
+        };
+
+        let config = input.gen_config().unwrap();
+        let flags = config.get_flags();
+        assert!(!flags.disable_relay_data);
+        assert!(flags.prefer_peer_relay);
+
+        let output = NetworkConfig::new_from_config(&config).unwrap();
+        assert_eq!(output.disable_relay_data, Some(false));
+        assert_eq!(output.prefer_peer_relay, Some(true));
+    }
+
+    #[test]
+    fn legacy_enabled_vpn_portal_config_reports_migration_error() {
+        let error = NetworkConfig {
+            enable_vpn_portal: Some(true),
+            ..standalone_config()
+        }
+        .gen_config()
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("legacy VPN portal"), "{error}");
+    }
+
+    #[test]
+    fn legacy_disabled_vpn_portal_defaults_are_ignored() {
+        let config = NetworkConfig {
+            enable_vpn_portal: Some(false),
+            vpn_portal_listen_port: Some(0),
+            vpn_portal_client_network_addr: Some(String::new()),
+            vpn_portal_client_network_len: Some(0),
+            ..standalone_config()
+        }
+        .gen_config()
+        .unwrap();
+
+        assert!(config.get_vpn_portal_config().is_none());
+    }
+
+    #[cfg(feature = "browser-config")]
+    #[test]
+    fn browser_merge_reconciles_renamed_flags() {
+        let original = r#"
+[flags]
+default_protocol = "udp"
+enable_encryption = false
+enable_ipv6 = false
+accept_dns = false
+private_mode = false
+"#;
+
+        for value in [Some(false), Some(true), None] {
+            let network_config = NetworkConfig {
+                disable_encryption: value,
+                disable_ipv6: value,
+                enable_magic_dns: value,
+                enable_private_mode: value,
+                ..standalone_config()
+            };
+            let merged = merge_network_config_toml(original, &network_config).unwrap();
+            let merged: toml::Table = toml::from_str(&merged).unwrap();
+            let flags = merged["flags"].as_table().unwrap();
+
+            assert_eq!(flags["default_protocol"].as_str(), Some("udp"));
+            for (field, expected) in [
+                ("enable_encryption", value.map(|disabled| !disabled)),
+                ("enable_ipv6", value.map(|disabled| !disabled)),
+                ("accept_dns", value),
+                ("private_mode", value),
+            ] {
+                assert_eq!(
+                    flags.get(field).and_then(toml::Value::as_bool),
+                    expected,
+                    "merging {field} from API value {value:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "browser-config")]
+    #[test]
+    fn browser_merge_preserves_fields_outside_the_shared_form() {
+        let original = r#"
+instance_name = "module-instance"
+rpc_portal = "0.0.0.0:15888"
+tcp_whitelist = ["22"]
+stun_servers = ["custom.example.com:3478"]
+
+[network_identity]
+network_name = "old-network"
+network_secret = "secret"
+
+[flags]
+default_protocol = "udp"
+disable_p2p = true
+"#;
+        let parsed = TomlConfigLoader::new_from_str(original).unwrap();
+        let mut network_config = NetworkConfig::new_from_config(&parsed).unwrap();
+        network_config.network_name = Some("edited-network".to_owned());
+        network_config.disable_p2p = Some(false);
+
+        let merged = merge_network_config_toml(original, &network_config).unwrap();
+        let merged: toml::Table = toml::from_str(&merged).unwrap();
+
+        assert_eq!(merged["instance_name"].as_str(), Some("module-instance"));
+        assert_eq!(merged["rpc_portal"].as_str(), Some("0.0.0.0:15888"));
+        assert_eq!(merged["tcp_whitelist"][0].as_str(), Some("22"));
+        assert_eq!(
+            merged["stun_servers"][0].as_str(),
+            Some("custom.example.com:3478")
+        );
+        assert_eq!(
+            merged["network_identity"]["network_name"].as_str(),
+            Some("edited-network")
+        );
+        assert_eq!(merged["flags"]["default_protocol"].as_str(), Some("udp"));
+        assert_eq!(merged["flags"]["disable_p2p"].as_bool(), Some(false));
+    }
+
+    #[cfg(feature = "browser-config")]
+    #[test]
+    fn browser_merge_normalizes_camel_case_flag_aliases() {
+        let original = r#"
+[flags]
+disableP2p = true
+enableEncryption = false
+foreignRelayBpsLimit = 1234
+"#;
+        let parsed_orig = TomlConfigLoader::new_from_str(original).unwrap();
+        let mut network_config = NetworkConfig::new_from_config(&parsed_orig).unwrap();
+        network_config.disable_p2p = Some(false);
+
+        let merged = merge_network_config_toml(original, &network_config).unwrap();
+        let parsed = TomlConfigLoader::new_from_str(&merged)
+            .expect("merged config should be parseable without duplicate-field error");
+        assert!(!parsed.get_flags().disable_p2p);
+        assert!(!parsed.get_flags().enable_encryption);
+        assert_eq!(parsed.get_flags().foreign_relay_bps_limit, 1234);
+
+        let merged_table: toml::Table = toml::from_str(&merged).unwrap();
+        let flags = merged_table["flags"].as_table().unwrap();
+        assert_eq!(
+            flags.get("disable_p2p").and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert!(flags.get("disableP2p").is_none());
+        assert_eq!(
+            flags
+                .get("enable_encryption")
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert!(flags.get("enableEncryption").is_none());
+        assert_eq!(
+            flags
+                .get("foreign_relay_bps_limit")
+                .and_then(toml::Value::as_integer),
+            Some(1234)
+        );
+        assert!(flags.get("foreignRelayBpsLimit").is_none());
+    }
+
+    #[cfg(feature = "browser-config")]
+    #[test]
+    fn browser_merge_repro_camel_case_disable_p2p_collision() {
+        let original = r#"
+[flags]
+disableP2p = false
+"#;
+        let mut network_config = standalone_config();
+        network_config.hostname = Some("new-hostname".to_owned());
+        network_config.disable_p2p = Some(false);
+
+        let merged = merge_network_config_toml(original, &network_config).unwrap();
+        let parsed = TomlConfigLoader::new_from_str(&merged)
+            .expect("saving config with camelCase alias must not fail on reload");
+        assert!(!parsed.get_flags().disable_p2p);
+
+        let merged_table: toml::Table = toml::from_str(&merged).unwrap();
+        let flags = merged_table["flags"].as_table().unwrap();
+        assert_eq!(
+            flags.get("disable_p2p").and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert!(flags.get("disableP2p").is_none());
     }
 }

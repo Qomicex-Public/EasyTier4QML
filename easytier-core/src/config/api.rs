@@ -4,13 +4,24 @@ use easytier_proto::api::manage::{
     self, NetworkConfig, NetworkingMethod, PortForwardConfig as ApiPortForwardConfig,
 };
 
-use super::toml::{ConfigLoader as _, TomlConfig};
+use optionize::Optionizable as _;
+
+use super::{
+    api_input::set_network_flags,
+    toml::{ConfigLoader as _, TomlConfig},
+};
 
 pub fn network_config_from_toml(config: &TomlConfig) -> NetworkConfig {
     let default_config = TomlConfig::default();
     let mut result = NetworkConfig {
         instance_id: Some(config.get_id().to_string()),
         dhcp: Some(config.get_dhcp()),
+        dhcp_ipv4_cidr: config.get_dhcp_config().cidr().map(|cidr| cidr.to_string()),
+        dhcpv6: Some(config.get_dhcpv6()),
+        dhcp_ipv6_cidr: config
+            .get_dhcpv6_config()
+            .cidr()
+            .map(|cidr| cidr.to_string()),
         ..Default::default()
     };
 
@@ -80,16 +91,23 @@ pub fn network_config_from_toml(config: &TomlConfig) -> NetworkConfig {
     }
 
     if let Some(vpn_config) = config.get_vpn_portal_config() {
-        result.enable_vpn_portal = Some(true);
-        result.vpn_portal_client_network_addr =
-            Some(vpn_config.client_cidr.first_address().to_string());
-        result.vpn_portal_client_network_len = Some(vpn_config.client_cidr.network_length() as i32);
-        result.vpn_portal_listen_port = Some(vpn_config.wireguard_listen.port() as i32);
+        result.vpn_portal_config = Some(manage::VpnPortalConfig {
+            enabled: vpn_config.enabled,
+            wireguard_listen: vpn_config.wireguard_listen.to_string(),
+            wireguard_private_key: vpn_config.wireguard_private_key,
+            clients: vpn_config
+                .clients
+                .into_iter()
+                .map(|client| manage::VpnPortalClientConfig {
+                    name: client.name,
+                    virtual_ip: client.virtual_ip.to_string(),
+                    groups: client.groups,
+                })
+                .collect(),
+        });
     }
 
-    if let Some(routes) = config.get_routes()
-        && !routes.is_empty()
-    {
+    if let Some(routes) = config.get_routes() {
         result.enable_manual_routes = Some(true);
         result.routes = routes.iter().map(ToString::to_string).collect();
     }
@@ -110,57 +128,49 @@ pub fn network_config_from_toml(config: &TomlConfig) -> NetworkConfig {
     result.credential_file = config
         .get_credential_file()
         .map(|path| path.to_string_lossy().into_owned());
+    result.managed_credentials = config
+        .get_managed_credentials()
+        .into_iter()
+        .map(|credential| credential.downgrade())
+        .collect();
 
-    let flags = config.get_flags();
-    let default_flags = default_config.get_flags();
-    result.latency_first = Some(flags.latency_first);
-    result.dev_name = Some(flags.dev_name.clone());
-    result.use_smoltcp = Some(flags.use_smoltcp);
-    result.disable_ipv6 = Some(!flags.enable_ipv6);
-    result.enable_kcp_proxy = Some(flags.enable_kcp_proxy);
-    result.disable_kcp_input = Some(flags.disable_kcp_input);
-    result.enable_quic_proxy = Some(flags.enable_quic_proxy);
-    result.disable_quic_input = Some(flags.disable_quic_input);
-    result.disable_p2p = Some(flags.disable_p2p);
-    result.p2p_only = Some(flags.p2p_only);
-    result.lazy_p2p = Some(flags.lazy_p2p);
-    result.bind_device = Some(flags.bind_device);
-    result.socket_mark = flags.socket_mark;
-    result.no_tun = Some(flags.no_tun);
-    result.enable_exit_node = Some(flags.enable_exit_node);
-    result.relay_all_peer_rpc = Some(flags.relay_all_peer_rpc);
-    result.need_p2p = Some(flags.need_p2p);
-    result.multi_thread = Some(flags.multi_thread);
-    result.proxy_forward_by_system = Some(flags.proxy_forward_by_system);
-    result.disable_encryption = Some(!flags.enable_encryption);
-    result.disable_tcp_hole_punching = Some(flags.disable_tcp_hole_punching);
-    result.disable_udp_hole_punching = Some(flags.disable_udp_hole_punching);
-    result.disable_upnp = Some(flags.disable_upnp);
-    result.disable_relay_data = Some(flags.disable_relay_data);
-    result.enable_udp_broadcast_relay = Some(flags.enable_udp_broadcast_relay);
-    result.disable_sym_hole_punching = Some(flags.disable_sym_hole_punching);
-    result.enable_magic_dns = Some(flags.accept_dns);
-    result.mtu = Some(flags.mtu as i32);
-    result.data_compress_algo = (flags.data_compress_algo != default_flags.data_compress_algo)
-        .then_some(flags.data_compress_algo);
-    result.encryption_algorithm = (flags.encryption_algorithm
-        != default_flags.encryption_algorithm)
-        .then_some(flags.encryption_algorithm);
-    result.instance_recv_bps_limit =
-        (flags.instance_recv_bps_limit != u64::MAX).then_some(flags.instance_recv_bps_limit);
-    result.enable_private_mode = Some(flags.private_mode);
+    set_network_flags(&mut result, config.get_flags_patch());
     result.acl = config.get_acl();
 
-    if flags.relay_network_whitelist == "*" {
-        result.enable_relay_network_whitelist = Some(false);
-    } else {
-        result.enable_relay_network_whitelist = Some(true);
-        result.relay_network_whitelist = flags
-            .relay_network_whitelist
-            .split_whitespace()
-            .map(ToOwned::to_owned)
-            .collect();
-    }
-
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::toml::ManagedCredentialConfig;
+
+    #[test]
+    fn includes_managed_credentials() {
+        let config = TomlConfig::default();
+        config.set_managed_credentials(vec![ManagedCredentialConfig {
+            credential_id: "managed-a".to_owned(),
+            credential_secret: "credential-secret".to_owned(),
+            groups: vec!["ops".to_owned()],
+            allow_relay: true,
+            allowed_proxy_cidrs: vec!["10.0.0.0/24".to_owned()],
+            expiry_unix: 2_000_000_000,
+            reusable: false,
+        }]);
+
+        let projected = network_config_from_toml(&config);
+
+        assert_eq!(
+            projected.managed_credentials,
+            vec![manage::ManagedCredentialConfig {
+                credential_id: "managed-a".to_owned(),
+                credential_secret: "credential-secret".to_owned(),
+                groups: vec!["ops".to_owned()],
+                allow_relay: true,
+                allowed_proxy_cidrs: vec!["10.0.0.0/24".to_owned()],
+                expiry_unix: 2_000_000_000,
+                reusable: Some(false),
+            }]
+        );
+    }
 }

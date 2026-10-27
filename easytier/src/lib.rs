@@ -12,15 +12,18 @@ mod vpn_portal;
 pub mod common;
 #[cfg(feature = "management")]
 pub mod core;
+#[cfg(feature = "upnp")]
+pub(crate) mod igd_next;
 pub mod proto;
 #[cfg(feature = "management-rpc")]
 pub mod rpc_service;
 #[cfg(feature = "management")]
 pub mod service_manager;
 pub(crate) mod socket;
+pub mod socket_protector;
 pub mod tunnel;
 pub mod utils;
-#[cfg(feature = "management")]
+#[cfg(feature = "web-client")]
 pub mod web_client;
 
 #[cfg(test)]

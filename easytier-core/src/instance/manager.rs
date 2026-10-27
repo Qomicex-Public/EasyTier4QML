@@ -15,14 +15,14 @@ use dashmap::DashMap;
 use uuid::Uuid;
 
 use crate::config::toml::TomlConfig;
-use crate::instance::{CoreInstance, CoreInstanceHost};
+use crate::instance::{CoreInstance, CoreInstanceHost, CoreInstanceState};
 use crate::process_runtime::CoreProcessRuntime;
-#[cfg(feature = "management")]
+#[cfg(feature = "web-client")]
 use crate::{
     config::toml::{ConfigLoader as _, ConfigSource},
     management::network_instance_running_info,
 };
-#[cfg(feature = "management")]
+#[cfg(feature = "web-client")]
 use easytier_proto::api::manage::NetworkInstanceRunningInfo;
 
 /// Stable identity required by the instance collection.
@@ -205,6 +205,39 @@ struct ActiveStopGuard {
     notifier: Arc<tokio::sync::Notify>,
 }
 
+#[derive(Default)]
+struct InstanceStateChanges {
+    generation: AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+impl InstanceStateChanges {
+    fn generation(&self) -> usize {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn mark_changed(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait_for_change(&self, generation: usize) -> usize {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Register the waiter before reading the generation: notify_waiters
+            // does not retain permits, so a change landing between the read
+            // and the await would otherwise be missed until the next change.
+            notified.as_mut().enable();
+            let current = self.generation();
+            if current != generation {
+                return current;
+            }
+            notified.await;
+        }
+    }
+}
+
 impl Drop for ActiveStopGuard {
     fn drop(&mut self) {
         let previous = self.active_stops.fetch_sub(1, Ordering::AcqRel);
@@ -224,6 +257,7 @@ pub struct InstanceManager<F: InstanceFactory> {
     mutation_lock: Arc<tokio::sync::Mutex<()>>,
     runtime_handle: Option<tokio::runtime::Handle>,
     active_stops: Arc<AtomicUsize>,
+    instance_state_changes: Arc<InstanceStateChanges>,
 }
 
 impl<F: InstanceFactory> InstanceManager<F> {
@@ -238,6 +272,7 @@ impl<F: InstanceFactory> InstanceManager<F> {
             mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             runtime_handle,
             active_stops: Arc::new(AtomicUsize::new(0)),
+            instance_state_changes: Arc::new(InstanceStateChanges::default()),
         }
     }
 
@@ -291,6 +326,12 @@ impl<F: InstanceFactory> InstanceManager<F> {
             .remove(&instance_id)
     }
 
+    pub fn config_control(&self, instance_id: Uuid) -> Option<ConfigFileControl> {
+        self.config_controls
+            .get(&instance_id)
+            .map(|control| control.clone())
+    }
+
     pub fn mutation_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
         self.mutation_lock.clone()
     }
@@ -304,6 +345,16 @@ impl<F: InstanceFactory> InstanceManager<F> {
             guard: Some(self.daemon_guard.clone()),
             notifier: self.notifier.clone(),
         }
+    }
+
+    pub(crate) fn instance_state_generation(&self) -> usize {
+        self.instance_state_changes.generation()
+    }
+
+    pub(crate) async fn wait_for_instance_state_change(&self, generation: usize) -> usize {
+        self.instance_state_changes
+            .wait_for_change(generation)
+            .await
     }
 }
 
@@ -333,10 +384,16 @@ where
         let instance_id = instance.instance_id();
         self.config_controls.insert(instance_id, control);
         let notifier = self.notifier.clone();
+        let instance_state_changes = self.instance_state_changes.clone();
         runtime.spawn(async move {
             if let Err(error) = instance.start().await {
-                tracing::error!(%error, %instance_id, "instance failed to start");
+                tracing::error!(
+                    error = %format_args!("{error:#}"),
+                    %instance_id,
+                    "instance failed to start"
+                );
             }
+            instance_state_changes.mark_changed();
             notifier.notify_one();
         });
         Ok(instance_id)
@@ -367,6 +424,7 @@ where
             drop(active_stop);
             return Ok(self.instance_ids());
         }
+        self.instance_state_changes.mark_changed();
 
         runtime
             .spawn(async move {
@@ -397,18 +455,25 @@ where
             .collect()
     }
 
+    pub fn failed_instance_ids(&self) -> Vec<Uuid> {
+        self.list()
+            .into_iter()
+            .filter(|instance| {
+                instance.state() == CoreInstanceState::Stopped
+                    && instance
+                        .latest_error()
+                        .is_some_and(|error| !error.trim().is_empty())
+            })
+            .map(|instance| instance.instance_id())
+            .collect()
+    }
+
     pub fn instance(&self, instance_id: Uuid) -> Option<Arc<CoreInstance<H>>> {
         self.get(instance_id)
     }
 
     pub fn instances(&self) -> Vec<Arc<CoreInstance<H>>> {
         self.list()
-    }
-
-    pub fn config_control(&self, instance_id: Uuid) -> Option<ConfigFileControl> {
-        self.config_controls
-            .get(&instance_id)
-            .map(|control| control.clone())
     }
 
     pub fn attach_tun_fd(&self, instance_id: Uuid, fd: i32) -> anyhow::Result<()> {
@@ -418,9 +483,9 @@ where
     }
 
     pub fn data_plane_runtime_handle(&self, instance_id: &Uuid) -> Option<tokio::runtime::Handle> {
-        self.instance(*instance_id)?;
-        self.runtime_handle
-            .clone()
+        self.instance(*instance_id)?
+            .runtime_handle()
+            .or_else(|| self.runtime_handle.clone())
             .or_else(|| tokio::runtime::Handle::try_current().ok())
     }
 
@@ -439,25 +504,25 @@ where
         }
     }
 
-    #[cfg(feature = "management")]
+    #[cfg(feature = "web-client")]
     pub fn config(&self, instance_id: Uuid) -> Option<TomlConfig> {
         self.get(instance_id)
             .and_then(|instance| instance.toml_config())
     }
 
-    #[cfg(feature = "management")]
+    #[cfg(feature = "web-client")]
     pub fn config_source(&self, instance_id: Uuid) -> Option<ConfigSource> {
         self.config(instance_id)
             .map(|config| config.get_network_config_source())
     }
 
-    #[cfg(feature = "management")]
+    #[cfg(feature = "web-client")]
     pub async fn network_info(&self, instance_id: Uuid) -> Option<NetworkInstanceRunningInfo> {
         let instance = self.get(instance_id)?;
         network_instance_running_info(instance.as_ref()).await.ok()
     }
 
-    #[cfg(feature = "management")]
+    #[cfg(feature = "web-client")]
     pub async fn collect_network_infos(
         &self,
     ) -> anyhow::Result<std::collections::BTreeMap<Uuid, NetworkInstanceRunningInfo>> {
@@ -471,7 +536,7 @@ where
         Ok(result)
     }
 
-    #[cfg(feature = "management")]
+    #[cfg(feature = "web-client")]
     pub fn collect_network_infos_sync(
         &self,
     ) -> anyhow::Result<std::collections::BTreeMap<Uuid, NetworkInstanceRunningInfo>> {
@@ -530,6 +595,39 @@ where
             .ok_or_else(|| anyhow::anyhow!("instance {instance_id} not found"))?
             .data_plane_udp_bind(local_port, timeout)
             .await?)
+    }
+}
+
+#[cfg(test)]
+mod instance_state_change_tests {
+    use super::InstanceStateChanges;
+    use std::{sync::Arc, time::Duration};
+
+    #[tokio::test]
+    async fn state_change_wait_observes_existing_and_future_changes() {
+        let changes = Arc::new(InstanceStateChanges::default());
+
+        let observed = changes.generation();
+        changes.mark_changed();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), changes.wait_for_change(observed))
+                .await
+                .expect("an existing change must not be lost"),
+            1
+        );
+
+        let observed = changes.generation();
+        let waiter_changes = changes.clone();
+        let waiter = tokio::spawn(async move { waiter_changes.wait_for_change(observed).await });
+        tokio::task::yield_now().await;
+        changes.mark_changed();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("a future change must wake the waiter")
+                .unwrap(),
+            2
+        );
     }
 }
 

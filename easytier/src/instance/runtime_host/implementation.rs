@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use easytier_core::{
-    gateway::dhcp::DhcpIpv4Host,
+    gateway::dhcp::DhcpHost,
     host::packet::HostPacketReceiver,
     instance::{CorePacketPlane, InstanceRuntimeHost, PacketEgressHost},
 };
@@ -10,10 +10,14 @@ use super::NativeInstanceRuntimeHost;
 
 #[async_trait::async_trait]
 impl InstanceRuntimeHost for NativeInstanceRuntimeHost {
+    fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
+        self.executor.as_ref().map(|executor| executor.handle())
+    }
+
     async fn prepare(
         &self,
         packet_plane: Arc<CorePacketPlane>,
-    ) -> anyhow::Result<Option<Arc<dyn DhcpIpv4Host>>> {
+    ) -> anyhow::Result<Option<Arc<dyn DhcpHost>>> {
         self.prepare_runtime(packet_plane).await
     }
 
@@ -29,14 +33,21 @@ impl InstanceRuntimeHost for NativeInstanceRuntimeHost {
         self.management_events_snapshot()
     }
 
-    #[cfg(feature = "management")]
-    fn synchronize_config(&self, patch: &crate::proto::api::config::InstanceConfigPatch) {
-        self.event_journal.synchronize_config(patch);
+    #[cfg(feature = "web-client")]
+    fn synchronize_config(
+        &self,
+        patch: &crate::proto::api::config::InstanceConfigPatch,
+        config: &easytier_core::config::runtime::CoreInstanceRuntimeConfig,
+    ) {
+        self.synchronize_global_ctx_config(patch, config);
     }
 
-    #[cfg(feature = "management")]
+    #[cfg(feature = "web-client")]
     fn publish_config_patch(&self, patch: crate::proto::api::config::InstanceConfigPatch) {
+        #[cfg(feature = "management")]
         self.event_journal.publish_config_patch(patch);
+        #[cfg(not(feature = "management"))]
+        let _ = patch;
     }
 
     fn attach_tun_fd(&self, fd: i32) -> anyhow::Result<()> {

@@ -6,11 +6,11 @@ mod config;
 mod data_plane_extension;
 mod lifecycle;
 mod management;
-#[cfg(feature = "management")]
+#[cfg(feature = "web-client")]
 mod management_extension;
 mod management_state;
 pub mod manager;
-mod packet_io;
+pub(crate) mod packet_io;
 mod packet_plane;
 #[cfg(feature = "proxy-packet")]
 mod packet_proxy_extension;
@@ -35,7 +35,6 @@ use url::Url;
 #[cfg(feature = "tcp-hole-punch")]
 use crate::connectivity::hole_punch::tcp::TcpHolePunchConnector;
 use crate::{
-    config::peers::{AclRuleConfig, PeerRuntimeSnapshot},
     config::runtime::{CoreInstanceRuntimeConfig, CoreRuntimeConfig, CoreRuntimeConfigStore},
     config::toml::TomlConfig,
     connectivity::hole_punch::port_mapping::UdpPortMappingPlatform,
@@ -59,14 +58,14 @@ use crate::{
         },
     },
     events::CoreEventSink,
-    gateway::dhcp::DhcpIpv4Host,
+    gateway::dhcp::DhcpHost,
     host::{
         dns::{DnsRecordResolver, DnsResolver},
         packet::{HostPacketReceiver, PacketSink, host_packet_channel},
     },
     listener::{
-        AcceptedSocketHandler, ExternalListenerFactory, ExternalListenerRequest, ListenerFactory,
-        RunningListenerRegistry,
+        AcceptedSocketHandler, ExternalListenerFactory, ExternalListenerRequest,
+        HostListenerRegistration, ListenerFactory, RunningListenerRegistry,
         plan::{ListenerRuntimeConfig, PreparedListenerPlan, prepare_listener_plan},
         transport::{
             AcceptedTransport, CoreListenerRuntime, HostAcceptedTcpSocket,
@@ -91,13 +90,14 @@ use crate::gateway::proxy::icmp_host::IcmpProxyHost;
 #[cfg(feature = "wrapped-transport")]
 use crate::gateway::proxy::wrapped_transport::WrappedTransportEngines;
 #[cfg(feature = "vpn-portal")]
-use crate::gateway::vpn_portal::VpnPortalHost;
+use crate::gateway::vpn_portal::PortalHost;
+use crate::gateway::vpn_portal::PortalRuntimeConfig;
 
 #[cfg(feature = "public-ipv6-provider")]
 use crate::peers::public_ipv6::provider::PublicIpv6ProviderPlatform;
 
-#[cfg(feature = "dhcp-ipv4")]
-use crate::gateway::dhcp::DhcpIpv4Runtime;
+#[cfg(any(feature = "dhcp-ipv4", feature = "dhcp-ipv6"))]
+use crate::gateway::dhcp::DhcpRuntime;
 #[cfg(feature = "proxy-cidr-monitor")]
 use crate::gateway::proxy::cidr_monitor::ProxyCidrMonitorRuntime;
 #[cfg(feature = "proxy-packet")]
@@ -105,7 +105,7 @@ use crate::gateway::proxy::service::CoreProxyModule;
 #[cfg(feature = "wrapped-transport")]
 use crate::gateway::proxy::wrapped_transport::WrappedTransportProxyModule;
 #[cfg(feature = "vpn-portal")]
-use crate::gateway::vpn_portal::VpnPortalModule;
+use crate::gateway::vpn_portal::PortalModule;
 #[cfg(feature = "proxy-smoltcp-stack")]
 use crate::gateway::{
     DataPlaneRuntime, DataPlaneSession, PortForwardAdapter, Socks5GatewayAdapter,
@@ -146,9 +146,18 @@ impl CoreInstanceState {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreInstanceStartupPlan {
+    #[serde(default = "default_true")]
     pub gateway: bool,
+    #[serde(default = "default_true")]
+    pub packet_proxy: bool,
+    #[serde(default)]
+    pub connectivity: CoreConnectivityMode,
 }
 
 impl CoreInstanceStartupPlan {
@@ -159,8 +168,24 @@ impl CoreInstanceStartupPlan {
 
 impl Default for CoreInstanceStartupPlan {
     fn default() -> Self {
-        Self { gateway: true }
+        Self {
+            gateway: true,
+            packet_proxy: true,
+            connectivity: CoreConnectivityMode::Full,
+        }
     }
+}
+
+/// Selects which portable connectivity Modules participate in one instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreConnectivityMode {
+    #[default]
+    Full,
+    /// Dial configured peers without listeners, discovery, or direct connectivity.
+    OutboundOnly,
+    /// Accept Host-registered listeners without constructing outbound socket Modules.
+    InboundOnly,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -182,6 +207,10 @@ pub struct CoreInstanceConfig {
     pub instance_name: String,
     pub peer: PortablePeerManagerConfig,
     pub connectivity: CoreConnectivityConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpn_portal: Option<PortalRuntimeConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_credentials: Vec<crate::config::toml::ManagedCredentialConfig>,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -192,36 +221,24 @@ pub struct PeerRelaySessionSnapshot {
     pub has_session: bool,
 }
 
-fn validate_core_instance_config(
-    config: &CoreInstanceConfig,
-) -> anyhow::Result<Option<crate::proto::acl::Acl>> {
-    let acl = config.connectivity.runtime.acl.build()?;
-    build_capabilities::validate(config)?;
-    Ok(acl)
-}
-
 fn proxy_cidr_snapshot(config: &CoreInstanceRuntimeConfig) -> ProxyCidrSnapshot {
     ProxyCidrSnapshot::from_proxy_networks(&config.peer.runtime.core.routes.proxy_networks)
-}
-
-fn retain_core_peer_identity(
-    peer: &mut Arc<PeerRuntimeSnapshot>,
-    peer_id: crate::config::PeerId,
-    instance_id: Option<[u8; 16]>,
-) {
-    let peer = Arc::make_mut(peer);
-    peer.runtime.core.node.peer_id = Some(peer_id);
-    peer.runtime.core.node.instance_id = instance_id;
 }
 
 /// Host-owned resources that must be prepared for the complete Instance
 /// lifetime, such as a native packet interface.
 #[async_trait::async_trait]
 pub trait InstanceRuntimeHost: std::any::Any + Send + Sync + 'static {
+    /// Optional Host-owned executor used for construction, lifecycle, and data-plane tasks.
+    /// Hosts without a dedicated executor continue to use the caller's runtime.
+    fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
+        None
+    }
+
     async fn prepare(
         &self,
         packet_plane: Arc<CorePacketPlane>,
-    ) -> anyhow::Result<Option<Arc<dyn DhcpIpv4Host>>>;
+    ) -> anyhow::Result<Option<Arc<dyn DhcpHost>>>;
 
     async fn shutdown(&self);
 
@@ -238,10 +255,15 @@ pub trait InstanceRuntimeHost: std::any::Any + Send + Sync + 'static {
 
     /// Applies Host-side cached views of fields already committed to the
     /// shared TOML model.
-    #[cfg(feature = "management")]
-    fn synchronize_config(&self, _patch: &crate::proto::api::config::InstanceConfigPatch) {}
+    #[cfg(feature = "web-client")]
+    fn synchronize_config(
+        &self,
+        _patch: &crate::proto::api::config::InstanceConfigPatch,
+        _config: &CoreInstanceRuntimeConfig,
+    ) {
+    }
 
-    #[cfg(feature = "management")]
+    #[cfg(feature = "web-client")]
     fn publish_config_patch(&self, _patch: crate::proto::api::config::InstanceConfigPatch) {}
 
     fn attach_tun_fd(&self, _fd: i32) -> anyhow::Result<()> {
@@ -254,7 +276,7 @@ impl InstanceRuntimeHost for () {
     async fn prepare(
         &self,
         _packet_plane: Arc<CorePacketPlane>,
-    ) -> anyhow::Result<Option<Arc<dyn DhcpIpv4Host>>> {
+    ) -> anyhow::Result<Option<Arc<dyn DhcpHost>>> {
         Ok(None)
     }
 
@@ -288,6 +310,7 @@ where
     pub protocol: Option<Arc<dyn ClientProtocolUpgrader<<H as VirtualTcpSocketFactory>::Socket>>>,
     pub external_listener_factory:
         Option<Arc<dyn ExternalListenerFactory<AcceptedTransport<HostAcceptedTcpSocket<H>>>>>,
+    pub host_listener_registrations: Vec<HostListenerRegistration>,
     pub server_protocol: Option<Arc<dyn ServerProtocolUpgrader<HostAcceptedTcpSocket<H>>>>,
     /// Optional OS port-mapping adapter. STUN-only hole punching remains
     /// available when the host does not provide one.
@@ -301,7 +324,7 @@ where
     #[cfg(feature = "public-ipv6-provider")]
     pub public_ipv6_provider: Option<Arc<dyn PublicIpv6ProviderPlatform>>,
     #[cfg(feature = "vpn-portal")]
-    pub vpn_portal: Option<Arc<dyn VpnPortalHost>>,
+    pub vpn_portal: Option<Arc<dyn PortalHost>>,
 }
 
 impl<H> CoreHostAdapters<H>
@@ -347,6 +370,7 @@ where
             wrapped_transports: WrappedTransportEngines::default(),
             protocol: None,
             external_listener_factory: None,
+            host_listener_registrations: Vec::new(),
             server_protocol: None,
             udp_hole_punch_platform: None,
             #[cfg(feature = "proxy-packet")]
@@ -389,13 +413,13 @@ where
     pub(super) cancel: CancellationToken,
     pub(super) peer_manager: Arc<PeerManagerCore>,
     packet_plane: Arc<CorePacketPlane>,
-    pub(super) manual: ManualConnectorManager<H>,
-    pub(super) direct: DirectConnectorManager<H>,
+    pub(super) manual: Option<ManualConnectorManager<H>>,
+    pub(super) direct: Option<DirectConnectorManager<H>>,
     #[cfg(feature = "tcp-hole-punch")]
-    tcp_hole_punch: TcpHolePunchConnector<H, PeerManagerCore>,
+    tcp_hole_punch: Option<TcpHolePunchConnector<H, PeerManagerCore>>,
     pub(super) listener: Option<Arc<CoreListenerRuntime<H>>>,
     running_listeners: Arc<RunningListenerRegistry>,
-    pub(super) udp_hole_punch: CoreUdpHolePunchService<H, PeerManagerCore>,
+    pub(super) udp_hole_punch: Option<CoreUdpHolePunchService<H, PeerManagerCore>>,
     #[cfg(feature = "wrapped-transport")]
     wrapped_transport: Option<Arc<WrappedTransportProxyModule>>,
     #[cfg(feature = "proxy-smoltcp-stack")]
@@ -411,16 +435,16 @@ where
     packet_proxy: Arc<CoreProxyModule<H>>,
     #[cfg(feature = "proxy-cidr-monitor")]
     proxy_cidr_monitor: ProxyCidrMonitorRuntime,
-    #[cfg(feature = "dhcp-ipv4")]
-    dhcp_ipv4: DhcpIpv4Runtime,
+    #[cfg(any(feature = "dhcp-ipv4", feature = "dhcp-ipv6"))]
+    dhcp: DhcpRuntime,
     pub(super) packet_egress: Arc<dyn PacketEgressHost>,
     pub(super) packet_receiver: Mutex<Option<HostPacketReceiver>>,
     pub(super) peer_center: Arc<PeerCenterInstance>,
     #[cfg(feature = "public-ipv6-provider")]
     public_ipv6_provider: PublicIpv6ProviderRuntime,
     #[cfg(feature = "vpn-portal")]
-    vpn_portal: Arc<VpnPortalModule>,
-    #[cfg(feature = "proxy-smoltcp-stack")]
+    vpn_portal: Arc<PortalModule>,
+    #[cfg(feature = "proxy-packet")]
     pub(super) startup_plan: CoreInstanceStartupPlan,
     pub(super) runtime_config: CoreRuntimeConfigStore,
     #[cfg(feature = "test-utils")]
@@ -480,8 +504,11 @@ where
         host_config: CoreInstanceHostConfig,
         mut adapters: CoreHostAdapters<H>,
     ) -> anyhow::Result<Arc<Self>> {
-        let initial_acl = validate_core_instance_config(&config)?;
+        build_capabilities::validate(&config)?;
+        let connectivity_mode = config.connectivity.startup_plan.connectivity;
         let instance_name = config.instance_name;
+        #[cfg(feature = "vpn-portal")]
+        let vpn_portal_config = config.vpn_portal.clone();
         let (packet_tx, packet_rx) = host_packet_channel();
         let runtime_config = CoreRuntimeConfigStore::new(
             config.connectivity.runtime.clone(),
@@ -504,26 +531,40 @@ where
             public_ipv6_host,
             public_ipv6_events,
         );
-        let stun = Self::prepare_stun(&adapters, &config.connectivity);
-        let peer_stun: Arc<dyn StunInfoProvider> = stun.clone();
-        let foreign_rpc_registrar = Arc::new(ForeignDirectConnectorRpcRegistrar::new(
-            adapters.host.clone(),
-            stun.clone(),
-        ));
+        let running_listeners = Arc::new(RunningListenerRegistry::default());
+        let stun = (connectivity_mode == CoreConnectivityMode::Full)
+            .then(|| Self::prepare_stun(&adapters, &config.connectivity));
+        let (peer_stun, foreign_rpc_registrar): (
+            Arc<dyn PeerStunInfoSource>,
+            Arc<dyn crate::peers::foreign_network::ForeignNetworkRpcRegistrar>,
+        ) = match &stun {
+            Some(stun) => (
+                Arc::new(CoreStunPeerInfoSource(stun.clone())),
+                Arc::new(ForeignDirectConnectorRpcRegistrar::new(
+                    adapters.host.clone(),
+                    stun.clone(),
+                    running_listeners.clone(),
+                )),
+            ),
+            None => (Arc::new(()), Arc::new(())),
+        };
         let peer_manager = Arc::new(PeerManagerCore::new(
             config.peer,
+            config.managed_credentials,
             runtime_config.clone(),
-            Arc::new(CoreStunPeerInfoSource(peer_stun)),
+            peer_stun,
             packet_tx,
             public_ipv6_runtime.clone(),
             events.clone(),
             adapters.credential_storage.take(),
             foreign_rpc_registrar,
         )?);
-        peer_manager.reload_acl(initial_acl.as_ref());
         let config = config.connectivity;
+        let configured_listeners = (connectivity_mode != CoreConnectivityMode::OutboundOnly)
+            .then_some(config.listeners.as_ref())
+            .flatten();
         let listener_plan = prepare_listener_plan(
-            config.listeners.as_ref(),
+            configured_listeners,
             peer_manager.instance_id(),
             adapters.server_protocol.as_deref(),
             adapters.external_listener_factory.as_deref(),
@@ -543,6 +584,7 @@ where
             wrapped_transports,
             protocol,
             external_listener_factory,
+            host_listener_registrations,
             server_protocol,
             udp_hole_punch_platform,
             #[cfg(feature = "proxy-packet")]
@@ -556,6 +598,12 @@ where
             #[cfg(feature = "vpn-portal")]
             vpn_portal,
         } = adapters;
+        let host_listener_registrations = if connectivity_mode == CoreConnectivityMode::OutboundOnly
+        {
+            Vec::new()
+        } else {
+            host_listener_registrations
+        };
         let dns_records: Arc<dyn DnsRecordResolver> = dns.clone();
         let dns: Arc<dyn DnsResolver> = dns;
         let ring_registry = process_runtime.ring_registry();
@@ -570,28 +618,33 @@ where
             manual: manual_options,
             direct: direct_options,
         } = config;
-        #[cfg(not(feature = "proxy-smoltcp-stack"))]
+        #[cfg(not(feature = "proxy-packet"))]
         let _ = startup_plan;
+        if connectivity_mode == CoreConnectivityMode::InboundOnly && !initial_peers.is_empty() {
+            anyhow::bail!("inbound-only connectivity does not support outbound peers");
+        }
+        let accepted_tunnel_handler = PeerAcceptedTunnelHandler::new(&peer_manager, events.clone());
         let accepted_transport_handler: Arc<
             dyn AcceptedSocketHandler<AcceptedTransport<HostAcceptedTcpSocket<H>>>,
         > = match server_protocol {
-            Some(server_protocol) => {
-                let tunnel_handler = PeerAcceptedTunnelHandler::new(&peer_manager, events.clone());
-                Arc::new(ProtocolAcceptedTransportHandler::new(
-                    &tunnel_handler,
-                    server_protocol,
-                ))
-            }
-            None => Arc::new(RawAcceptedTransportHandler::new(&peer_manager)),
+            Some(server_protocol) => Arc::new(ProtocolAcceptedTransportHandler::new(
+                &accepted_tunnel_handler,
+                server_protocol,
+            )),
+            None => Arc::new(RawAcceptedTransportHandler::new(
+                accepted_tunnel_handler.clone(),
+            )),
         };
-        let running_listeners = Arc::new(RunningListenerRegistry::default());
         let PreparedListenerPlan {
             transports,
             external,
             failures,
         } = listener_plan;
-        let mut external_factories = Vec::with_capacity(external.len());
-        if !external.is_empty() && external_listener_factory.is_none() {
+        let mut external_factories =
+            Vec::with_capacity(external.len() + host_listener_registrations.len());
+        if (!external.is_empty() || !host_listener_registrations.is_empty())
+            && external_listener_factory.is_none()
+        {
             anyhow::bail!("listener plan requires an external listener factory");
         }
         for (listener, socket_context) in external {
@@ -603,6 +656,19 @@ where
             external_factories.push(ListenerFactory::new(
                 move || factory.create(request.clone()),
                 listener.must_succeed,
+            ));
+        }
+        for request in host_listener_registrations {
+            let factory = external_listener_factory.clone().unwrap();
+            if !factory.supports_scheme(request.url.scheme()) {
+                anyhow::bail!(
+                    "external listener factory does not support Host listener scheme {}",
+                    request.url.scheme()
+                );
+            }
+            external_factories.push(ListenerFactory::new(
+                move || factory.create(request.clone()),
+                true,
             ));
         }
         let has_listener_work =
@@ -620,40 +686,51 @@ where
                 running_listeners.clone(),
             ))
         });
-        let protocol = protocol.unwrap_or_else(|| {
-            Arc::new(CoreClientProtocolUpgrader::new(
-                CoreClientProtocolConfig::default(),
-            ))
+        let protocol = (connectivity_mode != CoreConnectivityMode::InboundOnly).then(|| {
+            protocol.unwrap_or_else(|| {
+                Arc::new(CoreClientProtocolUpgrader::new(
+                    CoreClientProtocolConfig::default(),
+                ))
+            })
         });
-        let endpoint_resolver = Arc::new(CoreManualEndpointResolver::new(
-            host.clone(),
-            dns.clone(),
-            dns_records,
-            endpoint_discovery,
-        ));
-        let manual = ManualConnectorManager::new(
-            peer_manager.clone(),
-            host.clone(),
-            dns.clone(),
-            endpoint_resolver,
-            protocol.clone(),
-            ring_registry,
-            manual_options,
-            events.clone(),
-        );
-        for url in initial_peers {
-            manual.add_connector(url)?;
-        }
-        let udp_hole_punch_socket_context = direct_options.udp_bind.context.clone();
-        let udp_hole_punch = CoreUdpHolePunchService::new(
-            peer_manager.clone(),
-            host.clone(),
-            stun.clone(),
-            udp_hole_punch_platform,
-            events.clone(),
-            udp_hole_punch_socket_context,
-            protocol.clone(),
-        );
+        let manual = if let Some(protocol) = &protocol {
+            let endpoint_resolver = Arc::new(CoreManualEndpointResolver::new(
+                host.clone(),
+                dns.clone(),
+                dns_records,
+                endpoint_discovery,
+            ));
+            let manual = ManualConnectorManager::new(
+                peer_manager.clone(),
+                host.clone(),
+                dns.clone(),
+                endpoint_resolver,
+                protocol.clone(),
+                ring_registry,
+                manual_options,
+                events.clone(),
+            );
+            for url in initial_peers {
+                manual.add_connector(url)?;
+            }
+            Some(manual)
+        } else {
+            None
+        };
+        let udp_hole_punch = stun
+            .as_ref()
+            .zip(protocol.as_ref())
+            .map(|(stun, protocol)| {
+                CoreUdpHolePunchService::new(
+                    peer_manager.clone(),
+                    host.clone(),
+                    stun.clone(),
+                    udp_hole_punch_platform,
+                    events.clone(),
+                    direct_options.udp_bind.context.clone(),
+                    protocol.clone(),
+                )
+            });
         let proxy_cidr_table = Arc::new(ProxyCidrTable::from_snapshot(proxy_cidr_snapshot(
             runtime_config.snapshot().as_ref(),
         )));
@@ -713,30 +790,41 @@ where
             host.clone(),
             direct_options.tcp_bind.context.clone(),
             events.clone(),
+            instance_runtime.runtime_handle(),
         );
         #[cfg(feature = "tcp-hole-punch")]
-        let tcp_hole_punch = TcpHolePunchConnector::new(
-            peer_manager.clone(),
-            host.clone(),
-            stun.clone(),
-            direct_options.tcp_bind.context.clone(),
-            protocol.clone(),
-            Arc::new(crate::connectivity::protocol::CoreServerProtocolUpgrader::<
-                HostAcceptedTcpSocket<H>,
-            >::new(
-                crate::connectivity::protocol::CoreServerProtocolConfig::default(),
-            )),
-        );
-        let direct = DirectConnectorManager::new_with_running_listeners(
-            peer_manager.clone(),
-            host.clone(),
-            protected_tcp_ports,
-            stun.clone(),
-            running_listeners.clone(),
-            dns,
-            protocol,
-            direct_options,
-        );
+        let tcp_hole_punch = stun
+            .as_ref()
+            .zip(protocol.as_ref())
+            .map(|(stun, protocol)| {
+                TcpHolePunchConnector::new(
+                    peer_manager.clone(),
+                    host.clone(),
+                    stun.clone(),
+                    direct_options.tcp_bind.context.clone(),
+                    protocol.clone(),
+                    Arc::new(crate::connectivity::protocol::CoreServerProtocolUpgrader::<
+                        HostAcceptedTcpSocket<H>,
+                    >::new(
+                        crate::connectivity::protocol::CoreServerProtocolConfig::default(),
+                    )),
+                )
+            });
+        let direct = match (stun, protocol) {
+            (Some(stun), Some(protocol)) => {
+                Some(DirectConnectorManager::new_with_running_listeners(
+                    peer_manager.clone(),
+                    host.clone(),
+                    protected_tcp_ports,
+                    stun,
+                    running_listeners.clone(),
+                    dns,
+                    protocol,
+                    direct_options,
+                ))
+            }
+            _ => None,
+        };
         let peer_center = Arc::new(PeerCenterInstance::new(peer_manager.clone()));
         #[cfg(feature = "public-ipv6-provider")]
         let public_ipv6_provider = PublicIpv6ProviderRuntime::new(
@@ -745,12 +833,13 @@ where
             public_ipv6_runtime,
         );
         #[cfg(feature = "vpn-portal")]
-        let vpn_portal = VpnPortalModule::new(
+        let vpn_portal = PortalModule::new(
             peer_manager.clone(),
             runtime_config.clone(),
+            vpn_portal_config,
             vpn_portal,
             events.clone(),
-        );
+        )?;
         #[cfg(feature = "proxy-cidr-monitor")]
         let proxy_cidr_monitor =
             ProxyCidrMonitorRuntime::new(proxy_cidr_monitor_enabled, events.clone());
@@ -796,8 +885,8 @@ where
             packet_proxy,
             #[cfg(feature = "proxy-cidr-monitor")]
             proxy_cidr_monitor,
-            #[cfg(feature = "dhcp-ipv4")]
-            dhcp_ipv4: DhcpIpv4Runtime::new(),
+            #[cfg(any(feature = "dhcp-ipv4", feature = "dhcp-ipv6"))]
+            dhcp: DhcpRuntime::new(),
             packet_egress,
             packet_receiver: Mutex::new(Some(packet_rx)),
             peer_center,
@@ -805,7 +894,7 @@ where
             public_ipv6_provider,
             #[cfg(feature = "vpn-portal")]
             vpn_portal,
-            #[cfg(feature = "proxy-smoltcp-stack")]
+            #[cfg(feature = "proxy-packet")]
             startup_plan,
             runtime_config,
             #[cfg(feature = "test-utils")]
@@ -817,21 +906,14 @@ where
         CoreInstanceState::from_u8(self.state.load(Ordering::Acquire))
     }
 
+    /// Returns the peer manager for tunnels accepted outside this instance's
+    /// regular listener path, such as the shared Web listener.
+    pub fn peer_manager(&self) -> &Arc<PeerManagerCore> {
+        &self.peer_manager
+    }
+
     fn set_state(&self, state: CoreInstanceState) {
         self.state.store(state as u8, Ordering::Release);
-    }
-
-    async fn reload_acl_config_inner(&self, config: &AclRuleConfig) -> anyhow::Result<()> {
-        let acl = config.build()?;
-        self.peer_manager.reload_acl(acl.as_ref());
-        #[cfg(feature = "test-utils")]
-        self.acl_reload_count.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn sync_peer_runtime_state(&self, snapshot: &PeerRuntimeSnapshot) {
-        self.peer_manager
-            .set_avoid_relay_data_preference(snapshot.avoid_relay_data_preference);
     }
 
     /// Publishes one complete instance configuration version. Host changes have
@@ -846,7 +928,7 @@ where
 
     pub(crate) async fn update_runtime_config_under_operation(
         &self,
-        mut config: CoreInstanceRuntimeConfig,
+        config: CoreInstanceRuntimeConfig,
     ) -> anyhow::Result<()> {
         if matches!(
             self.state(),
@@ -855,36 +937,63 @@ where
             anyhow::bail!("runtime config cannot update while instance is stopping or stopped");
         }
         self.validate_runtime_config_capabilities(&config)?;
-        let current = self.runtime_config.snapshot();
-        retain_core_peer_identity(
-            &mut config.peer,
-            self.peer_id(),
-            current.peer.runtime.core.node.instance_id,
-        );
-        let refresh_acl_groups = current.peer.peer_group_memberships
-            != config.peer.peer_group_memberships
-            || current.peer.acl_group_declarations != config.peer.acl_group_declarations;
-        if current.services.acl != config.services.acl {
-            self.reload_acl_config_inner(&config.services.acl).await?;
-        }
-        self.sync_peer_runtime_state(&config.peer);
-        self.runtime_config.replace(config);
-        self.proxy_cidr_table
-            .update_snapshot(proxy_cidr_snapshot(self.runtime_config.snapshot().as_ref()));
-        if refresh_acl_groups {
-            self.refresh_acl_groups().await;
-        }
         #[cfg(feature = "proxy-smoltcp-stack")]
+        let prepared = self.prepare_port_forwards(&config).await?;
+        self.commit_runtime_config_under_operation(
+            config,
+            #[cfg(feature = "proxy-smoltcp-stack")]
+            prepared,
+            || (),
+        )
+        .await
+    }
+
+    #[cfg(feature = "proxy-smoltcp-stack")]
+    pub(crate) async fn prepare_port_forwards(
+        &self,
+        config: &CoreInstanceRuntimeConfig,
+    ) -> anyhow::Result<Option<crate::gateway::PreparedPortForwards<H>>> {
         self.port_forward_adapter
-            .reload(
-                &self
-                    .runtime_config
-                    .snapshot()
-                    .services
-                    .gateway
-                    .port_forwards,
-            )
+            .prepare(&config.services.gateway.port_forwards)
+            .await
+    }
+
+    pub(crate) async fn commit_runtime_config_under_operation(
+        &self,
+        config: CoreInstanceRuntimeConfig,
+        #[cfg(feature = "proxy-smoltcp-stack")] prepared: Option<
+            crate::gateway::PreparedPortForwards<H>,
+        >,
+        commit_config: impl FnOnce(),
+    ) -> anyhow::Result<()> {
+        #[cfg(feature = "test-utils")]
+        let reload_acl = self.runtime_config.snapshot().services.acl != config.services.acl;
+        let (published, cleanup) = self
+            .peer_manager
+            .update_runtime_config_with(config, || {
+                #[cfg(feature = "proxy-smoltcp-stack")]
+                let cleanup = prepared.map(|prepared| prepared.commit());
+                #[cfg(not(feature = "proxy-smoltcp-stack"))]
+                let cleanup: Option<tokio::task::JoinHandle<()>> = None;
+                commit_config();
+                cleanup
+            })
             .await?;
+        #[cfg(feature = "test-utils")]
+        if reload_acl {
+            self.acl_reload_count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.proxy_cidr_table
+            .update_snapshot(proxy_cidr_snapshot(&published));
+        if let Some(cleanup) = cleanup {
+            let _ = cleanup.await;
+        }
+        #[cfg(feature = "proxy-packet")]
+        if self.state() == CoreInstanceState::Running && self.startup_plan.packet_proxy {
+            // A running instance may gain its first proxy network here. Start
+            // from the published configuration, just as during initial startup.
+            self.start_packet_proxy().await?;
+        }
         Ok(())
     }
 
@@ -892,7 +1001,10 @@ where
         &self,
         config: &CoreInstanceRuntimeConfig,
     ) -> anyhow::Result<()> {
-        build_capabilities::validate_runtime(config)
+        build_capabilities::validate_runtime(config)?;
+        #[cfg(feature = "vpn-portal")]
+        self.vpn_portal.validate_runtime_config(config)?;
+        Ok(())
     }
 
     pub async fn wait(&self) {

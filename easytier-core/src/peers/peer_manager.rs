@@ -21,9 +21,15 @@ use tokio::task::JoinSet;
 use url::Url;
 
 use crate::{
-    config::peers::{HostRoutingPolicy, PeerRuntimeConfig, PeerRuntimeSnapshot},
-    config::runtime::CoreRuntimeConfigStore,
-    config::{P2pPolicyFlags, PeerId, ProxyNetworkConfig},
+    config::{
+        P2pPolicyFlags, PeerId, ProxyNetworkConfig,
+        peers::{
+            AclRuleConfig, HostRoutingPolicy, PeerGroupIdentity, PeerRuntimeConfig,
+            PeerRuntimeSnapshot,
+        },
+        runtime::{CoreInstanceRuntimeConfig, CoreRuntimeConfigStore},
+        toml::ManagedCredentialConfig,
+    },
     events::CoreEventSink,
     foundation::task::ExternalTaskSignal,
     host::packet::{HostPacket, HostPacketSender},
@@ -31,7 +37,7 @@ use crate::{
         CompressorAlgo, PacketType, ZCPacket,
         compressor::{Compressor as _, DefaultCompressor},
     },
-    proto::common::{FlagsInConfig, PeerFeatureFlag, StunInfo, Url as ProtoUrl},
+    proto::common::{Flags, PeerFeatureFlag, StunInfo, Url as ProtoUrl},
     proto::core_peer::peer::{ListPublicIpv6InfoResponse, PeerConnInfo, Route as CoreRoute},
     tunnel::{
         Tunnel,
@@ -43,7 +49,8 @@ use crate::{
 };
 
 use super::{
-    BoxNicPacketFilter, BoxPeerPacketFilter, PacketRecvChanReceiver, PeerPacketFilter,
+    BoxNicPacketFilter, BoxPeerPacketFilter, PacketRecvChanReceiver, PeerConnectionOrigin,
+    PeerPacketFilter, PeerPacketFilterResult, PeerPacketIngress,
     acl::AclFilter,
     conn::{
         peer_conn::{PeerConn, PeerConnId},
@@ -61,7 +68,7 @@ use super::{
     peer_center::instance::PeerCenterPeerManagerTrait,
     peer_rpc::{PeerRpcManager, PeerRpcManagerTransport},
     public_ipv6::{CorePublicIpv6Runtime, PublicIpv6Runtime},
-    recv_packet_from_chan,
+    recv_packet_envelope_from_chan,
     relay_peer_map::RelayPeerMap,
     route::{
         ArcRoute, DisabledRoute, ForeignNetworkRouteInfoMap, NextHopPolicy, Route, RouteInterface,
@@ -91,6 +98,7 @@ pub struct PeerSnapshot {
 pub struct NodeSnapshot {
     pub peer_id: PeerId,
     pub ipv4_addr: Option<cidr::Ipv4Inet>,
+    pub ipv6_addr: Option<cidr::Ipv6Inet>,
     pub proxy_networks: Vec<ProxyNetworkConfig>,
     pub hostname: String,
     pub stun_info: StunInfo,
@@ -206,14 +214,14 @@ pub struct PortablePeerManagerConfig {
     ///
     /// This is explicit because those contexts participate in the same
     /// handshake as the parent but do not inherit all parent policy flags.
-    pub foreign_context_default_flags: FlagsInConfig,
+    pub foreign_context_default_flags: Flags,
 }
 
 impl PortablePeerManagerConfig {
     pub fn new(mut runtime: PeerRuntimeConfig) -> Self {
         let policy = &runtime.core.peer_policy;
         let traffic = &runtime.core.traffic;
-        let flags = FlagsInConfig {
+        let flags = Flags {
             enable_encryption: policy.encryption_required,
             encryption_algorithm: crate::config::EncryptionAlgorithm::default().to_string(),
             disable_p2p: !policy.p2p_enabled,
@@ -235,6 +243,49 @@ impl PortablePeerManagerConfig {
             exit_nodes: Vec::new(),
             foreign_context_default_flags,
         }
+    }
+}
+
+fn matching_group_memberships(
+    declarations: &[PeerGroupIdentity],
+    configured_groups: &[String],
+) -> Vec<PeerGroupIdentity> {
+    let configured = configured_groups.iter().collect::<BTreeSet<_>>();
+    declarations
+        .iter()
+        .filter(|declaration| configured.contains(&declaration.group_name))
+        .cloned()
+        .collect()
+}
+
+fn first_missing_group<'a>(
+    memberships: &[PeerGroupIdentity],
+    configured_groups: &'a [String],
+) -> Option<&'a str> {
+    let resolved = memberships
+        .iter()
+        .map(|membership| membership.group_name.as_str())
+        .collect::<BTreeSet<_>>();
+    configured_groups
+        .iter()
+        .map(String::as_str)
+        .find(|group| !resolved.contains(group))
+}
+
+fn retain_runtime_owned_peer_state(
+    current: &CoreInstanceRuntimeConfig,
+    next: &mut CoreInstanceRuntimeConfig,
+    peer_id: PeerId,
+) {
+    let next_peer = Arc::make_mut(&mut next.peer);
+    next_peer.runtime.core.node.peer_id = Some(peer_id);
+    next_peer.runtime.core.node.instance_id = current.peer.runtime.core.node.instance_id;
+    next_peer.runtime.stun_info = current.peer.runtime.stun_info.clone();
+    if current.services.dhcp_ipv4 && next.services.dhcp_ipv4 {
+        next_peer.runtime.core.routes.ipv4 = current.peer.runtime.core.routes.ipv4.clone();
+    }
+    if current.services.dhcp_ipv6 && next.services.dhcp_ipv6 {
+        next_peer.runtime.core.routes.ipv6 = current.peer.runtime.core.routes.ipv6.clone();
     }
 }
 
@@ -406,7 +457,7 @@ struct NicPacketProcessor {
 
 #[async_trait::async_trait]
 impl PeerPacketFilter for NicPacketProcessor {
-    async fn try_process_packet_from_peer(&self, packet: ZCPacket) -> Option<ZCPacket> {
+    async fn try_process_packet_from_peer(&self, packet: ZCPacket) -> PeerPacketFilterResult {
         let hdr = packet.peer_manager_header().unwrap();
         if hdr.packet_type == PacketType::Data as u8 && !hdr.is_not_send_to_tun() {
             if hdr.is_encrypted() || hdr.is_compressed() {
@@ -417,16 +468,21 @@ impl PeerPacketFilter for NicPacketProcessor {
                     compressed = hdr.is_compressed(),
                     "dropping packet before nic because it is not fully decoded"
                 );
-                return None;
+                return PeerPacketFilterResult::Consumed;
             }
             tracing::trace!(?packet, "send packet to nic channel");
-            let _ = self
+            if let Err(error) = self
                 .nic_channel
-                .send(HostPacket::from_core_packet(packet))
-                .await;
-            None
+                .try_send(HostPacket::from_core_packet(packet))
+            {
+                tracing::trace!(
+                    ?error,
+                    "dropping packet because nic channel cannot accept it"
+                );
+            }
+            PeerPacketFilterResult::Consumed
         } else {
-            Some(packet)
+            PeerPacketFilterResult::Pass(packet)
         }
     }
 }
@@ -437,16 +493,16 @@ struct PeerRpcPacketProcessor {
 
 #[async_trait::async_trait]
 impl PeerPacketFilter for PeerRpcPacketProcessor {
-    async fn try_process_packet_from_peer(&self, packet: ZCPacket) -> Option<ZCPacket> {
+    async fn try_process_packet_from_peer(&self, packet: ZCPacket) -> PeerPacketFilterResult {
         let hdr = packet.peer_manager_header().unwrap();
         if hdr.packet_type == PacketType::TaRpc as u8
             || hdr.packet_type == PacketType::RpcReq as u8
             || hdr.packet_type == PacketType::RpcResp as u8
         {
             self.peer_rpc_tspt_sender.send(packet).unwrap();
-            None
+            PeerPacketFilterResult::Consumed
         } else {
-            Some(packet)
+            PeerPacketFilterResult::Pass(packet)
         }
     }
 }
@@ -719,6 +775,8 @@ pub struct PeerManagerCore {
     exit_nodes: Arc<RwLock<Vec<IpAddr>>>,
     acl_filter: Arc<AclFilter>,
     context: Arc<CorePeerContext>,
+    runtime_config: CoreRuntimeConfigStore,
+    runtime_config_update: Mutex<()>,
     is_secure_mode_enabled: bool,
     route: ArcRoute,
     traffic_metrics: Arc<TrafficMetricRecorder>,
@@ -760,6 +818,7 @@ impl PeerManagerCore {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         mut config: PortablePeerManagerConfig,
+        managed_credentials: Vec<ManagedCredentialConfig>,
         runtime_config: CoreRuntimeConfigStore,
         stun_info_source: Arc<dyn PeerStunInfoSource>,
         nic_channel: HostPacketSender,
@@ -768,6 +827,7 @@ impl PeerManagerCore {
         credential_storage: Option<Arc<dyn CredentialStorage>>,
         foreign_rpc_registrar: Arc<dyn ForeignNetworkRpcRegistrar>,
     ) -> anyhow::Result<Self> {
+        let initial_acl = runtime_config.snapshot().services.acl.build()?;
         let runtime = &mut config.snapshot.runtime;
         let flags = &config.snapshot.flags;
         let network_name = runtime.network_identity.network_name.clone();
@@ -870,7 +930,11 @@ impl PeerManagerCore {
                 credential_storage,
             },
         ));
-        Ok(Self::assemble(
+        context
+            .credential_manager()
+            .install_initial_managed_credentials(&managed_credentials)
+            .map_err(anyhow::Error::msg)?;
+        let peer_manager = Self::assemble(
             config.route_algo,
             my_peer_id,
             context,
@@ -882,7 +946,9 @@ impl PeerManagerCore {
             config.exit_nodes,
             config.foreign_context_default_flags,
             foreign_rpc_registrar,
-        ))
+        );
+        peer_manager.reload_acl(initial_acl.as_ref());
+        Ok(peer_manager)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -896,7 +962,7 @@ impl PeerManagerCore {
         is_secure_mode_enabled: bool,
         data_compress_algo: CompressorAlgo,
         exit_nodes: Vec<IpAddr>,
-        foreign_context_default_flags: FlagsInConfig,
+        foreign_context_default_flags: Flags,
         foreign_rpc_registrar: Arc<dyn ForeignNetworkRpcRegistrar>,
     ) -> Self {
         let stats_manager = core_context.stats_manager();
@@ -1085,6 +1151,8 @@ impl PeerManagerCore {
             data_compress_algo,
             exit_nodes,
             acl_filter,
+            runtime_config: core_context.runtime_config_store(),
+            runtime_config_update: Mutex::new(()),
             context: core_context,
             is_secure_mode_enabled,
             route,
@@ -1101,6 +1169,55 @@ impl PeerManagerCore {
 
     pub(crate) fn credential_manager(&self) -> Arc<CredentialManager> {
         self.context.credential_manager()
+    }
+
+    pub(crate) fn register_ephemeral_credential(
+        &self,
+        public_key: [u8; 32],
+        groups: Vec<String>,
+    ) -> anyhow::Result<uuid::Uuid> {
+        let credential_id = self
+            .credential_manager()
+            .register_ephemeral_credential(public_key, groups)
+            .map_err(anyhow::Error::msg)?;
+        self.notify_credential_changed();
+        Ok(credential_id)
+    }
+
+    pub(crate) async fn update_ephemeral_credential_groups(
+        &self,
+        credential_id: uuid::Uuid,
+        groups: Vec<String>,
+    ) -> Option<bool> {
+        let changed = self
+            .credential_manager()
+            .update_ephemeral_credential_groups(credential_id, groups)?;
+        if changed {
+            self.notify_credential_changed();
+            self.route.refresh_acl_groups().await;
+        }
+        Some(changed)
+    }
+
+    pub(crate) fn revoke_ephemeral_credential(&self, credential_id: uuid::Uuid) -> bool {
+        let revoked = self
+            .credential_manager()
+            .revoke_ephemeral_credential(credential_id);
+        if revoked {
+            self.notify_credential_changed();
+        }
+        revoked
+    }
+
+    pub(crate) async fn revoke_ephemeral_credential_and_refresh(
+        &self,
+        credential_id: uuid::Uuid,
+    ) -> bool {
+        let revoked = self.revoke_ephemeral_credential(credential_id);
+        if revoked {
+            self.route.refresh_acl_groups().await;
+        }
+        revoked
     }
 
     pub fn stats_manager(&self) -> Arc<StatsManager> {
@@ -1157,6 +1274,7 @@ impl PeerManagerCore {
         NodeSnapshot {
             peer_id: self.my_peer_id,
             ipv4_addr: self.context.ipv4(),
+            ipv6_addr: self.context.ipv6(),
             proxy_networks: self.context.proxy_networks(),
             hostname: self.context.hostname(),
             stun_info: self.context.stun_info(),
@@ -1198,6 +1316,18 @@ impl PeerManagerCore {
         self.get_route().list_foreign_network_info().await
     }
 
+    /// Whether the foreign network peer map can route back to `peer_id`.
+    #[doc(hidden)]
+    pub async fn foreign_network_has_gateway(
+        &self,
+        network_name: &str,
+        peer_id: PeerId,
+    ) -> Option<bool> {
+        self.foreign_network_manager
+            .has_gateway_for_peer(network_name, peer_id)
+            .await
+    }
+
     pub async fn list_foreign_network_infos(
         &self,
         include_trusted_keys: bool,
@@ -1215,8 +1345,153 @@ impl PeerManagerCore {
         self.acl_filter.get_stats()
     }
 
+    /// Bytes charged by the foreign network forward limiter, if configured.
+    #[doc(hidden)]
+    pub fn foreign_forward_metered_bytes(&self, network_name: &str) -> Option<u64> {
+        self.context
+            .foreign_forward_limiter(network_name)
+            .map(|limiter| limiter.metered_bytes())
+    }
+
+    /// Bytes charged by the instance-wide receive limiter, if configured.
+    #[doc(hidden)]
+    pub fn instance_recv_metered_bytes(&self) -> Option<u64> {
+        self.context
+            .recv_limiter("", false)
+            .map(|limiter| limiter.metered_bytes())
+    }
+
     pub fn acl_filter(&self) -> Arc<AclFilter> {
         self.acl_filter.clone()
+    }
+
+    pub(crate) async fn update_runtime_config(
+        &self,
+        config: CoreInstanceRuntimeConfig,
+    ) -> anyhow::Result<Arc<CoreInstanceRuntimeConfig>> {
+        self.update_runtime_config_with(config, || ())
+            .await
+            .map(|(published, ())| published)
+    }
+
+    pub(crate) async fn update_runtime_config_with<T>(
+        &self,
+        config: CoreInstanceRuntimeConfig,
+        before_publish: impl FnOnce() -> T,
+    ) -> anyhow::Result<(Arc<CoreInstanceRuntimeConfig>, T)> {
+        let _update = self.runtime_config_update.lock().await;
+        let current = self.runtime_config.snapshot();
+        let refresh_acl_groups = current.peer.peer_group_memberships
+            != config.peer.peer_group_memberships
+            || current.peer.acl_group_declarations != config.peer.acl_group_declarations;
+        let reload_acl = current.services.acl != config.services.acl;
+        let next_acl = reload_acl.then(|| config.services.acl.clone());
+        let next_built_acl = next_acl.as_ref().map(AclRuleConfig::build).transpose()?;
+
+        // Commit prepared host resources only after all fallible validation,
+        // with no cancellation point before publishing their configuration.
+        let committed = before_publish();
+        self.set_avoid_relay_data_preference(config.peer.avoid_relay_data_preference);
+        let published = self
+            .runtime_config
+            .replace_with_current(config, |current, next| {
+                retain_runtime_owned_peer_state(current, next, self.my_peer_id);
+            });
+        if let Some(acl) = next_built_acl.as_ref() {
+            self.reload_acl(acl.as_ref());
+        }
+        if refresh_acl_groups {
+            self.route.refresh_acl_groups().await;
+        }
+        Ok((published, committed))
+    }
+
+    /// Keeps this manager's ACL rules and group assignments aligned with a
+    /// network policy source. The subscription is owned by this manager and is
+    /// stopped with its other runtime tasks.
+    pub(crate) async fn follow_network_policy(
+        self: &Arc<Self>,
+        source: CoreRuntimeConfigStore,
+        configured_groups: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let mut peer_changes = source.subscribe_peer_runtime_changes();
+        let mut service_changes = source.subscribe_service_runtime_changes();
+        let configured_groups: Arc<[String]> = configured_groups.into();
+        self.apply_network_policy(&source, &configured_groups)
+            .await?;
+
+        let peer_manager = Arc::downgrade(self);
+        self.tasks.lock().await.spawn(async move {
+            loop {
+                let changed = tokio::select! {
+                    changed = peer_changes.changed() => changed,
+                    changed = service_changes.changed() => changed,
+                };
+                if changed.is_err() {
+                    return;
+                }
+                let _ = peer_changes.borrow_and_update();
+                let _ = service_changes.borrow_and_update();
+                let Some(peer_manager) = peer_manager.upgrade() else {
+                    return;
+                };
+                if let Err(error) = peer_manager
+                    .apply_network_policy(&source, &configured_groups)
+                    .await
+                {
+                    tracing::warn!(
+                        ?error,
+                        peer_id = peer_manager.my_peer_id,
+                        "failed to apply peer manager network policy"
+                    );
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn apply_network_policy(
+        &self,
+        source: &CoreRuntimeConfigStore,
+        configured_groups: &[String],
+    ) -> anyhow::Result<()> {
+        let source = source.snapshot();
+        let credential_peer = self.context.feature_flags().is_credential_peer;
+        let acl = if credential_peer {
+            source.services.acl.for_credential_peer()
+        } else {
+            source.services.acl.clone()
+        };
+        let (declarations, memberships, missing_group) = if credential_peer {
+            (Vec::new(), Vec::new(), None)
+        } else {
+            let declarations = source.peer.acl_group_declarations.clone();
+            let memberships = matching_group_memberships(&declarations, configured_groups);
+            let missing_group = first_missing_group(&memberships, configured_groups);
+            (declarations, memberships, missing_group)
+        };
+        let current = self.runtime_config.snapshot();
+        if current.services.acl == acl
+            && current.peer.acl_group_declarations == declarations
+            && current.peer.peer_group_memberships == memberships
+        {
+            return Ok(());
+        }
+
+        let mut next = current.as_ref().clone();
+        next.services.acl = acl;
+        let peer = Arc::make_mut(&mut next.peer);
+        peer.acl_group_declarations = declarations;
+        peer.peer_group_memberships = memberships;
+        self.update_runtime_config(next).await?;
+        if let Some(group) = missing_group {
+            tracing::warn!(
+                peer_id = self.my_peer_id,
+                group,
+                "configured peer ACL group is no longer declared"
+            );
+        }
+        Ok(())
     }
 
     pub fn network_name(&self) -> &str {
@@ -1264,7 +1539,6 @@ impl PeerManagerCore {
     pub fn get_peer_session_store(&self) -> Arc<PeerSessionStore> {
         self.peer_session_store.clone()
     }
-
     pub(crate) fn get_nic_channel(&self) -> HostPacketSender {
         self.nic_channel.clone()
     }
@@ -1294,6 +1568,13 @@ impl PeerManagerCore {
 
     pub fn get_route(&self) -> ArcRoute {
         self.route.clone()
+    }
+
+    pub(crate) async fn withdraw_routes_before_stop(&self) -> bool {
+        let Some(route) = self.route_algo_inst.ospf_route() else {
+            return true;
+        };
+        route.withdraw_self_conn_info().await
     }
 
     pub fn mark_recent_traffic(&self, dst_peer_id: PeerId) {
@@ -1335,31 +1616,51 @@ impl PeerManagerCore {
     pub async fn add_client_tunnel(
         &self,
         tunnel: Box<dyn Tunnel>,
-        is_directly_connected: bool,
     ) -> Result<(PeerId, PeerConnId), Error> {
-        self.peer_connection_admission
-            .add_client_tunnel(tunnel, is_directly_connected)
+        self.add_client_tunnel_with_peer_id_hint(tunnel, PeerConnectionOrigin::Manual, None)
             .await
     }
 
-    pub async fn add_client_tunnel_with_peer_id_hint(
+    pub(crate) async fn add_client_tunnel_with_peer_id_hint(
         &self,
         tunnel: Box<dyn Tunnel>,
-        is_directly_connected: bool,
+        origin: PeerConnectionOrigin,
         peer_id_hint: Option<PeerId>,
     ) -> Result<(PeerId, PeerConnId), Error> {
         self.peer_connection_admission
-            .add_client_tunnel_with_peer_id_hint(tunnel, is_directly_connected, peer_id_hint)
+            .add_client_tunnel_with_peer_id_hint(tunnel, origin, peer_id_hint)
             .await
     }
 
-    pub async fn add_tunnel_as_server(
+    pub(crate) async fn add_attached_ring_client_tunnel(
         &self,
         tunnel: Box<dyn Tunnel>,
-        is_directly_connected: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<(PeerId, PeerConnId), Error> {
+        self.add_client_tunnel_with_peer_id_hint(tunnel, PeerConnectionOrigin::Attached, None)
+            .await
+    }
+
+    pub async fn add_tunnel_as_server(&self, tunnel: Box<dyn Tunnel>) -> Result<(), Error> {
+        self.add_tunnel_as_server_with_origin(tunnel, PeerConnectionOrigin::Listener)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn add_tunnel_as_server_with_origin(
+        &self,
+        tunnel: Box<dyn Tunnel>,
+        origin: PeerConnectionOrigin,
+    ) -> Result<(PeerId, PeerConnId), Error> {
         self.peer_connection_admission
-            .add_tunnel_as_server(tunnel, is_directly_connected)
+            .add_tunnel_as_server_with_origin(tunnel, origin)
+            .await
+    }
+
+    pub(crate) async fn add_attached_ring_tunnel_as_server(
+        &self,
+        tunnel: Box<dyn Tunnel>,
+    ) -> Result<(PeerId, PeerConnId), Error> {
+        self.add_tunnel_as_server_with_origin(tunnel, PeerConnectionOrigin::Attached)
             .await
     }
 
@@ -1501,11 +1802,14 @@ impl PeerManagerCore {
         *self.exit_nodes.write().await = exit_nodes;
     }
 
-    pub(crate) fn reload_acl(&self, acl: Option<&crate::proto::acl::Acl>) {
-        // ACL rule effects are staged separately from configuration publication.
-        // Keep the submitted group snapshot unchanged so CoreInstance can detect
-        // the group change and refresh route trust state when the complete
-        // runtime configuration is published.
+    /// Shares the network's current exit nodes, including later updates, while
+    /// keeping this peer's route lookup and packet identity independent.
+    pub(super) fn inherit_exit_nodes(&mut self, network: &Self) {
+        self.exit_nodes = network.exit_nodes.clone();
+        self.outbound_packet_router.exit_nodes = self.exit_nodes.clone();
+    }
+
+    fn reload_acl(&self, acl: Option<&crate::proto::acl::Acl>) {
         self.acl_filter.reload_rules(acl);
     }
 
@@ -1532,6 +1836,12 @@ impl PeerManagerCore {
 
     pub(crate) async fn clear_resources(&self) {
         self.stop().await;
+        self.foreign_network_client.stop();
+        self.peers.clear_resources().await;
+        self.foreign_network_client
+            .get_peer_map()
+            .clear_resources()
+            .await;
         self.peer_packet_process_pipeline
             .store(Arc::new(Vec::new()));
         self.nic_packet_process_pipeline.store(Arc::new(Vec::new()));
@@ -1741,29 +2051,20 @@ impl PeerConnectionAdmission {
         self.denied_peers.contains(&peer_id)
     }
 
-    pub async fn add_client_tunnel(
-        &self,
-        tunnel: Box<dyn Tunnel>,
-        is_directly_connected: bool,
-    ) -> Result<(PeerId, PeerConnId), Error> {
-        self.add_client_tunnel_with_peer_id_hint(tunnel, is_directly_connected, None)
-            .await
-    }
-
     pub async fn add_client_tunnel_with_peer_id_hint(
         &self,
         tunnel: Box<dyn Tunnel>,
-        is_directly_connected: bool,
+        origin: PeerConnectionOrigin,
         peer_id_hint: Option<PeerId>,
     ) -> Result<(PeerId, PeerConnId), Error> {
-        let mut peer = PeerConn::new_with_peer_id_hint(
+        let mut peer = PeerConn::new_with_peer_id_hint_and_origin(
             self.my_peer_id,
             self.context.clone(),
             tunnel,
             peer_id_hint,
             self.peer_session_store.clone(),
+            origin,
         );
-        peer.set_is_hole_punched(!is_directly_connected);
         peer.do_handshake_as_client().await?;
         let conn_id = peer.get_conn_id();
         let peer_id = peer.get_peer_id();
@@ -1771,7 +2072,14 @@ impl PeerConnectionAdmission {
             return Err(Error::PeerDenied(peer_id));
         }
         let local_identity = self.context.network_identity();
-        if peer.get_network_identity().network_name == local_identity.network_name {
+        let is_local_network =
+            peer.get_network_identity().network_name == local_identity.network_name;
+        if origin == PeerConnectionOrigin::Attached && !is_local_network {
+            return Err(Error::SecretKeyError(
+                "attached ring peer must belong to the local network".to_string(),
+            ));
+        }
+        if is_local_network {
             let local_secure_mode = self
                 .context
                 .secure_mode()
@@ -1798,20 +2106,22 @@ impl PeerConnectionAdmission {
     }
 
     #[tracing::instrument(ret, skip(self, tunnel))]
-    pub async fn add_tunnel_as_server(
+    async fn add_tunnel_as_server_with_origin(
         &self,
         tunnel: Box<dyn Tunnel>,
-        is_directly_connected: bool,
-    ) -> Result<(), Error> {
+        origin: PeerConnectionOrigin,
+    ) -> Result<(PeerId, PeerConnId), Error> {
         tracing::info!("add tunnel as server start");
         let resolved_remote_addr = tunnel.info().and_then(|info| info.resolved_remote_addr);
         check_resolved_remote_addr_not_from_virtual_network(&self.context, resolved_remote_addr)?;
 
-        let mut conn = PeerConn::new(
+        let mut conn = PeerConn::new_with_peer_id_hint_and_origin(
             self.my_peer_id,
             self.context.clone(),
             tunnel,
+            None,
             self.peer_session_store.clone(),
+            origin,
         );
         let mut reserved_peer_id_network_name = None;
         let handshake_ret = conn
@@ -1857,6 +2167,14 @@ impl PeerConnectionAdmission {
         let peer_network_name = peer_identity.network_name.clone();
         let local_identity = self.context.network_identity();
         let is_local_network = peer_network_name == local_identity.network_name;
+        if origin == PeerConnectionOrigin::Attached && !is_local_network {
+            self.release_reserved_peer_id(&peer_network_name);
+            return Err(Error::SecretKeyError(
+                "attached ring peer must belong to the local network".to_string(),
+            ));
+        }
+        let peer_id = conn.get_peer_id();
+        let conn_id = conn.get_conn_id();
         let trusted_foreign_credential =
             matches!(conn.get_peer_identity_type(), PeerIdentityType::Credential)
                 && self
@@ -1874,8 +2192,6 @@ impl PeerConnectionAdmission {
                 "private mode is turned on, foreign network secret mismatch".to_string(),
             ));
         }
-
-        conn.set_is_hole_punched(!is_directly_connected);
 
         if self.is_peer_denied(conn.get_peer_id()) {
             self.release_reserved_peer_id(&peer_network_name);
@@ -1915,7 +2231,7 @@ impl PeerConnectionAdmission {
         self.release_reserved_peer_id(&peer_network_name);
 
         tracing::info!("add tunnel as server done");
-        Ok(())
+        Ok((peer_id, conn_id))
     }
 }
 
@@ -2389,6 +2705,10 @@ impl PeerOutboundPacketRouter {
         self.mark_recent_traffic_with_policy(dst_peer_id, packet_policy);
         self.check_p2p_only_before_send(dst_peer_id, packet_policy)?;
 
+        if msg.peer_manager_header().unwrap().packet_type == PacketType::Data as u8 {
+            msg.flow_key = crate::packet::flow::parse_flow_key(&msg);
+        }
+
         self.counters
             .compress_tx_bytes_before
             .add(msg.buf_len() as u64);
@@ -2535,7 +2855,7 @@ impl PeerOutboundPacketRouter {
     pub async fn send_msg_by_ip(
         &self,
         mut msg: ZCPacket,
-        ip_addr: IpAddr,
+        mut ip_addr: IpAddr,
         not_send_to_self: bool,
     ) -> Result<(), Error> {
         tracing::trace!(
@@ -2545,9 +2865,25 @@ impl PeerOutboundPacketRouter {
         );
 
         msg.fill_peer_manager_hdr(self.my_peer_id, 0, PacketType::Data as u8);
+        let filters_registered = !self.nic_packet_process_pipeline.load().is_empty();
         if !self.run_nic_packet_process_pipeline(&mut msg).await {
             return Ok(());
         }
+
+        if filters_registered
+            && let Ok(meta) = crate::instance::packet_io::parse_ip_packet(msg.payload())
+            && meta.destination != ip_addr
+        {
+            tracing::trace!(
+                original_dst = %ip_addr,
+                new_dst = %meta.destination,
+                "destination rewritten by nic packet filter"
+            );
+            ip_addr = meta.destination;
+        }
+
+        msg.flow_key = crate::packet::flow::parse_flow_key(&msg);
+
         let packet_policy = self.context.packet_policy();
         let cur_to_peer_id = msg.peer_manager_header().unwrap().to_peer_id.into();
         if cur_to_peer_id != 0 {
@@ -2762,29 +3098,51 @@ impl PeerPacketRouter {
 
     pub async fn run(mut self) {
         tracing::trace!("start_peer_recv");
-        while let Ok(ret) = recv_packet_from_chan(&mut self.packet_recv).await {
+        while let Ok(envelope) = recv_packet_envelope_from_chan(&mut self.packet_recv).await {
+            let (ret, ingress) = envelope.into_parts();
             let disable_relay_data = self.context.disable_relay_data();
+            let destination_is_attached = ret
+                .peer_manager_header()
+                .is_some_and(|header| self.peers.has_direct_attached_peer(header.to_peer_id.get()));
+            let drop_foreign_relay_data = disable_relay_data
+                && is_relay_data_zc_packet(&ret)
+                && !ingress.is_attached()
+                && !destination_is_attached;
             let Err(ret) = try_handle_foreign_network_packet(
                 ret,
                 self.my_peer_id,
                 &self.peers,
                 &self.foreign_network_manager,
                 self.stats_mgr.as_ref(),
-                disable_relay_data,
+                drop_foreign_relay_data,
             )
             .await
             else {
                 continue;
             };
 
-            self.handle_packet(ret, disable_relay_data).await;
+            self.handle_packet(ret, disable_relay_data, ingress).await;
         }
         panic!("done_peer_recv");
     }
 
-    async fn handle_packet(&self, mut ret: ZCPacket, disable_relay_data: bool) {
+    async fn handle_packet(
+        &self,
+        mut ret: ZCPacket,
+        disable_relay_data: bool,
+        ingress: PeerPacketIngress,
+    ) {
         let buf_len = ret.buf_len();
-        let is_relay_data_packet = is_relay_data_zc_packet(&ret);
+        let destination_is_attached = ret
+            .peer_manager_header()
+            .is_some_and(|header| self.peers.has_direct_attached_peer(header.to_peer_id.get()));
+        let drop_relay_data = should_drop_relay_data(
+            disable_relay_data,
+            &ret,
+            self.my_peer_id,
+            ingress,
+            destination_is_attached,
+        );
         let Some(hdr) = ret.mut_peer_manager_header() else {
             tracing::warn!(?ret, "invalid packet, skip");
             return;
@@ -2796,11 +3154,13 @@ impl PeerPacketRouter {
         let packet_type = hdr.packet_type;
         let is_encrypted = hdr.is_encrypted();
         if to_peer_id != self.my_peer_id {
-            if disable_relay_data && is_relay_data_packet {
+            if drop_relay_data {
+                let ingress_connection = ingress.peer_connection();
                 tracing::debug!(
                     ?from_peer_id,
                     ?to_peer_id,
                     packet_type,
+                    ?ingress_connection,
                     "drop forwarded relay data while relay data is disabled"
                 );
                 return;
@@ -2934,25 +3294,33 @@ impl PeerPacketRouter {
                 return;
             }
 
-            let mut processed = false;
-            let mut zc_packet = Some(ret);
-            tracing::trace!(?zc_packet, "try_process_packet_from_peer");
+            tracing::trace!(?ret, "try_process_packet_from_peer");
             let pipelines = self.peer_packet_process_pipeline.load_full();
-            for pipeline in pipelines.iter().rev() {
-                if let Some(filter) = pipeline.filter_if_active() {
-                    zc_packet = filter
-                        .try_process_packet_from_peer(zc_packet.unwrap())
-                        .await;
+            process_peer_packet(&pipelines, ret).await;
+        }
+    }
+}
+
+async fn process_peer_packet(pipelines: &[PeerPipelineEntry], packet: ZCPacket) {
+    let mut first = Some((packet, pipelines.len()));
+    // The ordinary single-packet path does not allocate this queue.
+    let mut pending = Vec::new();
+    'packets: while let Some((mut packet, next)) = first.take().or_else(|| pending.pop()) {
+        for (index, pipeline) in pipelines[..next].iter().enumerate().rev() {
+            let Some(filter) = pipeline.filter_if_active() else {
+                continue;
+            };
+            match filter.try_process_packet_from_peer(packet).await {
+                PeerPacketFilterResult::Consumed => continue 'packets,
+                PeerPacketFilterResult::Pass(next) => packet = next,
+                PeerPacketFilterResult::PassBatch(packets) => {
+                    // Resume each packet after the filter that produced it.
+                    pending.extend(packets.into_iter().rev().map(|packet| (packet, index)));
+                    continue 'packets;
                 }
-                if zc_packet.is_none() {
-                    processed = true;
-                    break;
-                }
-            }
-            if !processed {
-                tracing::error!(?zc_packet, "unhandled packet");
             }
         }
+        tracing::error!(?packet, "unhandled packet");
     }
 }
 
@@ -2979,13 +3347,30 @@ pub(crate) fn is_relay_data_zc_packet(packet: &ZCPacket) -> bool {
     is_relay_data_packet(hdr.packet_type)
 }
 
+fn should_drop_relay_data(
+    disable_relay_data: bool,
+    packet: &ZCPacket,
+    my_peer_id: PeerId,
+    ingress: PeerPacketIngress,
+    destination_is_attached: bool,
+) -> bool {
+    if !disable_relay_data || !is_relay_data_zc_packet(packet) {
+        return false;
+    }
+
+    let is_forwarded = packet
+        .peer_manager_header()
+        .is_some_and(|header| header.to_peer_id.get() != my_peer_id);
+    is_forwarded && !ingress.is_attached() && !destination_is_attached
+}
+
 pub(crate) async fn try_handle_foreign_network_packet(
     mut packet: ZCPacket,
     my_peer_id: PeerId,
     peer_map: &PeerMap,
     foreign_network_manager: &ForeignNetworkManager,
     stats_manager: &StatsManager,
-    disable_relay_data: bool,
+    drop_relay_data: bool,
 ) -> Result<(), ZCPacket> {
     let pm_header = packet.peer_manager_header().unwrap();
     if pm_header.packet_type != PacketType::ForeignNetworkPacket as u8 {
@@ -2995,7 +3380,7 @@ pub(crate) async fn try_handle_foreign_network_packet(
     let from_peer_id = pm_header.from_peer_id.get();
     let to_peer_id = pm_header.to_peer_id.get();
 
-    if disable_relay_data && is_relay_data_zc_packet(&packet) {
+    if drop_relay_data {
         tracing::debug!(
             ?from_peer_id,
             ?to_peer_id,
@@ -3268,6 +3653,7 @@ mod tests {
             let stun_info_source = Arc::new(RuntimeConfigStunInfoSource(runtime_config.clone()));
             Self::new(
                 config,
+                Vec::new(),
                 runtime_config,
                 stun_info_source,
                 nic_channel,
@@ -3277,6 +3663,58 @@ mod tests {
                 Arc::new(()),
             )
         }
+    }
+
+    #[tokio::test]
+    async fn packet_batches_resume_at_next_filter_in_order() {
+        struct Filter {
+            stage: u8,
+            seen: Arc<std::sync::Mutex<Vec<(u8, u8)>>>,
+        }
+        #[async_trait::async_trait]
+        impl PeerPacketFilter for Filter {
+            async fn try_process_packet_from_peer(
+                &self,
+                packet: ZCPacket,
+            ) -> PeerPacketFilterResult {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((self.stage, packet.payload()[0]));
+                match self.stage {
+                    0 => PeerPacketFilterResult::Consumed,
+                    1 | 2 => {
+                        let mut extra = packet.clone();
+                        extra.mut_payload()[0] += if self.stage == 1 { 10 } else { 1 };
+                        PeerPacketFilterResult::PassBatch(vec![packet, extra])
+                    }
+                    _ => PeerPacketFilterResult::Pass(packet),
+                }
+            }
+        }
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pipelines = (0..4)
+            .map(|stage| {
+                permanent_peer_pipeline_entry(Box::new(Filter {
+                    stage,
+                    seen: seen.clone(),
+                }))
+            })
+            .collect::<Vec<_>>();
+        process_peer_packet(&pipelines, ZCPacket::new_with_payload(&[0])).await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                (3, 0),
+                (2, 0),
+                (1, 0),
+                (0, 0),
+                (0, 10),
+                (1, 1),
+                (0, 1),
+                (0, 11),
+            ]
+        );
     }
 
     struct RuntimeConfigStunInfoSource(CoreRuntimeConfigStore);
@@ -3328,6 +3766,28 @@ mod tests {
         async fn try_process_packet_from_nic(&self, _data: &mut ZCPacket) -> bool {
             true
         }
+    }
+
+    #[tokio::test]
+    async fn full_host_packet_queue_does_not_block_peer_packet_processing() {
+        let (nic_channel, mut nic_receiver) = mpsc::channel(1);
+        nic_channel
+            .send(HostPacket::copy_from_payload(b"queued"))
+            .await
+            .unwrap();
+        let processor = NicPacketProcessor { nic_channel };
+        let mut packet = ZCPacket::new_with_payload(b"next");
+        packet.fill_peer_manager_hdr(1, 2, PacketType::Data as u8);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            processor.try_process_packet_from_peer(packet),
+        )
+        .await;
+
+        assert!(result.is_ok(), "a full host queue blocked the peer router");
+        assert!(matches!(result.unwrap(), PeerPacketFilterResult::Consumed));
+        assert_eq!(nic_receiver.try_recv().unwrap().payload(), b"queued");
     }
 
     #[test]
@@ -3432,6 +3892,35 @@ mod tests {
                 .await
         );
     }
+    #[tokio::test]
+    async fn runtime_updates_retain_manager_owned_peer_identity() {
+        let core = build_portable_for_test(portable_runtime_config("portable-net")).unwrap();
+        let current = core.runtime_config.snapshot();
+        let expected_peer_id = core.my_peer_id();
+        let expected_instance_id = current.peer.runtime.core.node.instance_id;
+        let mut next = current.as_ref().clone();
+        let next_peer = Arc::make_mut(&mut next.peer);
+        next_peer.runtime.core.node.peer_id = Some(expected_peer_id.wrapping_add(1));
+        next_peer.runtime.core.node.instance_id = Some([1; 16]);
+        let submitted = next.peer.clone();
+
+        let published = core.update_runtime_config(next).await.unwrap();
+
+        assert_eq!(
+            published.peer.runtime.core.node.peer_id,
+            Some(expected_peer_id)
+        );
+        assert_eq!(
+            published.peer.runtime.core.node.instance_id,
+            expected_instance_id
+        );
+        assert_eq!(
+            submitted.runtime.core.node.peer_id,
+            Some(expected_peer_id.wrapping_add(1))
+        );
+        assert_eq!(submitted.runtime.core.node.instance_id, Some([1; 16]));
+        core.clear_resources().await;
+    }
 
     #[cfg(not(feature = "zstd"))]
     #[tokio::test]
@@ -3489,6 +3978,247 @@ mod tests {
         assert!(!is_self);
     }
 
+    #[cfg(feature = "aes-gcm")]
+    #[tokio::test]
+    async fn proxy_ip_responses_get_flow_keys_without_classifying_fragments_or_wrapped_data() {
+        struct CaptureProxyPackets(mpsc::UnboundedSender<ZCPacket>);
+
+        #[async_trait::async_trait]
+        impl PeerPacketFilter for CaptureProxyPackets {
+            async fn try_process_packet_from_peer(
+                &self,
+                packet: ZCPacket,
+            ) -> PeerPacketFilterResult {
+                let packet_type = packet.peer_manager_header().unwrap().packet_type;
+                if [
+                    PacketType::Data,
+                    PacketType::KcpSrc,
+                    PacketType::KcpDst,
+                    PacketType::QuicSrc,
+                    PacketType::QuicDst,
+                ]
+                .iter()
+                .any(|kind| *kind as u8 == packet_type)
+                {
+                    self.0.send(packet).unwrap();
+                    PeerPacketFilterResult::Consumed
+                } else {
+                    PeerPacketFilterResult::Pass(packet)
+                }
+            }
+        }
+
+        let mut config = PortablePeerManagerConfig::new(portable_runtime_config("proxy-flow-key"));
+        config.snapshot.flags.enable_encryption = true;
+        config.snapshot.flags.encryption_algorithm = "aes-gcm".to_owned();
+        let core = build_portable_config_for_test(config).unwrap();
+        core.run().await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        core.add_packet_process_pipeline(Box::new(CaptureProxyPackets(tx)))
+            .await;
+
+        let expected = crate::packet::FlowKey {
+            src: ([10, 0, 0, 1], 1234).into(),
+            dst: ([10, 0, 0, 2], 5000).into(),
+            protocol: 17,
+        };
+        for (packet_type, fragment_flags, key) in [
+            (PacketType::Data, 0u16, Some(expected)),
+            (PacketType::Data, 0x2000, None),
+            (PacketType::Data, 1, None),
+            (PacketType::KcpSrc, 0, None),
+            (PacketType::KcpDst, 0, None),
+            (PacketType::QuicSrc, 0, None),
+            (PacketType::QuicDst, 0, None),
+        ] {
+            // Wrapped payloads deliberately resemble IP to check the packet-type guard.
+            let mut bytes = vec![0u8; 28];
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&28u16.to_be_bytes());
+            bytes[6..8].copy_from_slice(&fragment_flags.to_be_bytes());
+            bytes[8] = 64;
+            bytes[9] = 17;
+            bytes[12..16].copy_from_slice(&[10, 0, 0, 1]);
+            bytes[20..22].copy_from_slice(&1234u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&5000u16.to_be_bytes());
+            bytes[24..26].copy_from_slice(&8u16.to_be_bytes());
+            set_packet_destination(&mut bytes, expected.dst.ip());
+            let mut packet = ZCPacket::new_with_payload(&bytes);
+            packet.fill_peer_manager_hdr(core.my_peer_id(), core.my_peer_id(), packet_type as u8);
+            packet.mut_peer_manager_header().unwrap().set_no_proxy(true);
+            assert!(packet.flow_key.is_none());
+            core.send_msg_for_proxy(packet, core.my_peer_id())
+                .await
+                .unwrap();
+            let received = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(received.flow_key, key, "{packet_type:?}/{fragment_flags}");
+            assert_eq!(received.payload(), bytes);
+        }
+        core.clear_resources().await;
+    }
+
+    fn set_packet_destination(packet: &mut [u8], destination: IpAddr) {
+        match destination {
+            IpAddr::V4(destination) => {
+                assert_eq!(packet[0] >> 4, 4);
+                packet[16..20].copy_from_slice(&destination.octets());
+                packet[10..12].fill(0);
+                let mut checksum: u32 = packet[..20]
+                    .chunks_exact(2)
+                    .map(|word| u32::from(u16::from_be_bytes([word[0], word[1]])))
+                    .sum();
+                while checksum >> 16 != 0 {
+                    checksum = (checksum & 0xffff) + (checksum >> 16);
+                }
+                packet[10..12].copy_from_slice(&(!(checksum as u16)).to_be_bytes());
+            }
+            IpAddr::V6(destination) => {
+                assert_eq!(packet[0] >> 4, 6);
+                packet[24..40].copy_from_slice(&destination.octets());
+            }
+        }
+    }
+
+    struct DestinationRewriteNicFilter(IpAddr);
+
+    #[async_trait::async_trait]
+    impl super::super::NicPacketFilter for DestinationRewriteNicFilter {
+        async fn try_process_packet_from_nic(&self, packet: &mut ZCPacket) -> bool {
+            // Leave to_peer_id unset: the router must use the rewritten IP header.
+            assert_eq!(packet.peer_manager_header().unwrap().to_peer_id.get(), 0);
+            set_packet_destination(packet.mut_payload(), self.0);
+            true
+        }
+    }
+
+    async fn check_nic_filter_destination_routing(addresses: [IpAddr; 4]) {
+        let [source, original, rewritten, unrouted] = addresses;
+        let mut peers = Vec::new();
+        let mut receivers = Vec::new();
+        for address in [source, original, rewritten] {
+            let mut runtime = portable_runtime_config("nic-filter-routing");
+            if address.is_ipv4() {
+                runtime.core.routes.ipv4 = Some(IpPrefix::new(address, 24).unwrap());
+            } else {
+                runtime.core.routes.ipv6 = Some(IpPrefix::new(address, 64).unwrap());
+            }
+            let (sender, receiver) = host_packet_channel();
+            let peer = PeerManagerCore::new_portable_for_test(
+                PortablePeerManagerConfig::new(runtime),
+                sender,
+            )
+            .unwrap();
+            peer.run().await.unwrap();
+            peers.push(peer);
+            receivers.push(receiver);
+        }
+        let sender = &peers[0];
+        for peer in &peers[1..] {
+            let (client, server) = crate::tunnel::ring::create_ring_tunnel_pair();
+            let (client_result, server_result) = tokio::join!(
+                sender.add_client_tunnel(client),
+                peer.add_tunnel_as_server(server),
+            );
+            client_result.unwrap();
+            server_result.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if sender.get_msg_dst_peer(&original).await == (vec![peers[1].my_peer_id()], false)
+                    && sender.get_msg_dst_peer(&rewritten).await
+                        == (vec![peers[2].my_peer_id()], false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both destination routes must be ready before sending");
+        assert_eq!(
+            sender.get_msg_dst_peer(&unrouted).await,
+            (Vec::new(), false)
+        );
+        sender
+            .add_nic_packet_process_pipeline(Box::new(DestinationRewriteNicFilter(rewritten)))
+            .await;
+
+        // Exercise both misdelivery to an existing peer and silent loss for an
+        // address with no route. Send once per case, without retrying data packets.
+        for destination in [original, unrouted] {
+            let mut payload = match source {
+                IpAddr::V4(source) => {
+                    let mut payload = vec![0u8; 20];
+                    payload[0] = 0x45;
+                    payload[2..4].copy_from_slice(&20u16.to_be_bytes());
+                    payload[8] = 64;
+                    payload[9] = 253; // Experimental protocol; no transport header.
+                    payload[12..16].copy_from_slice(&source.octets());
+                    payload
+                }
+                IpAddr::V6(source) => {
+                    let mut payload = vec![0u8; 40];
+                    payload[0] = 0x60;
+                    payload[6] = 59; // No next header.
+                    payload[7] = 64;
+                    payload[8..24].copy_from_slice(&source.octets());
+                    payload
+                }
+            };
+            set_packet_destination(&mut payload, destination);
+            sender
+                .send_msg_by_ip(ZCPacket::new_with_payload(&payload), destination, false)
+                .await
+                .unwrap();
+
+            let packet = tokio::time::timeout(Duration::from_secs(5), receivers[2].recv())
+                .await
+                .expect("rewritten destination peer did not receive the packet")
+                .unwrap()
+                .into_core_packet();
+            set_packet_destination(&mut payload, rewritten);
+            assert_eq!(packet.payload(), payload);
+            let header = packet.peer_manager_header().unwrap();
+            assert_eq!(header.from_peer_id.get(), sender.my_peer_id());
+            assert_eq!(header.to_peer_id.get(), peers[2].my_peer_id());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), receivers[1].recv())
+                    .await
+                    .is_err(),
+                "packet reached the old destination"
+            );
+        }
+
+        for peer in &peers {
+            peer.clear_resources().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn nic_filter_rewritten_ipv4_destination_controls_routing() {
+        check_nic_filter_destination_routing([
+            "10.82.0.1".parse().unwrap(),
+            "10.82.0.2".parse().unwrap(),
+            "10.82.0.3".parse().unwrap(),
+            "10.82.0.99".parse().unwrap(),
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn nic_filter_rewritten_ipv6_destination_controls_routing() {
+        check_nic_filter_destination_routing([
+            "fd00::1".parse().unwrap(),
+            "fd00::2".parse().unwrap(),
+            "fd00::3".parse().unwrap(),
+            "fd00::99".parse().unwrap(),
+        ])
+        .await;
+    }
+
     #[tokio::test]
     async fn foreign_network_stop_waits_for_inflight_admission() {
         let core = build_portable_for_test(portable_runtime_config("portable-net")).unwrap();
@@ -3533,6 +4263,7 @@ mod tests {
 
         let core = PeerManagerCore::new(
             config,
+            Vec::new(),
             runtime_config,
             Arc::new(()),
             packet_tx,
@@ -3573,6 +4304,83 @@ mod tests {
         assert_eq!(groups[0].group_name, "ops");
         assert!(groups[0].verify("ops-secret", 86));
         assert_eq!(core.context.acl_group_declarations()[0].group_name, "ops");
+        core.clear_resources().await;
+    }
+
+    #[tokio::test]
+    async fn credential_peer_policy_sync_excludes_group_material() {
+        let mut runtime = portable_runtime_config("portable-net");
+        runtime.network_identity.network_secret = None;
+        runtime.network_identity.network_secret_digest = None;
+        runtime.secure_mode = Some(credential_secure_mode());
+        let core = Arc::new(build_portable_for_test(runtime).unwrap());
+
+        let acl = crate::proto::acl::Acl {
+            acl_v1: Some(crate::proto::acl::AclV1 {
+                chains: Vec::new(),
+                group: Some(crate::proto::acl::GroupInfo {
+                    declares: vec![crate::proto::acl::GroupIdentity {
+                        group_name: "ops".to_owned(),
+                        group_secret: "ops-secret".to_owned(),
+                    }],
+                    members: vec!["ops".to_owned()],
+                }),
+            }),
+        };
+        let mut services = CoreRuntimeConfig::default();
+        services.acl.acl = Some(acl.clone());
+        let mut source_peer = core.runtime_config.snapshot().peer.as_ref().clone();
+        source_peer.set_acl_groups(Some(&acl));
+        let source = CoreRuntimeConfigStore::new(services, Arc::new(source_peer));
+
+        core.follow_network_policy(source.clone(), vec!["ops".to_owned()])
+            .await
+            .unwrap();
+
+        let applied = core.runtime_config.snapshot();
+        assert!(applied.peer.acl_group_declarations.is_empty());
+        assert!(applied.peer.peer_group_memberships.is_empty());
+        assert!(
+            applied
+                .services
+                .acl
+                .acl
+                .as_ref()
+                .unwrap()
+                .acl_v1
+                .as_ref()
+                .unwrap()
+                .group
+                .is_none()
+        );
+
+        source.update_services(|services| {
+            services.acl.tcp_whitelist = vec!["22".to_owned()];
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let applied = core.runtime_config.snapshot();
+                if applied.services.acl.tcp_whitelist == ["22"] {
+                    assert!(
+                        applied
+                            .services
+                            .acl
+                            .acl
+                            .as_ref()
+                            .unwrap()
+                            .acl_v1
+                            .as_ref()
+                            .unwrap()
+                            .group
+                            .is_none()
+                    );
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         core.clear_resources().await;
     }
 
@@ -3676,6 +4484,7 @@ mod tests {
             admin_a
                 .credential_manager()
                 .revoke_credential(&generated.credential_id)
+                .unwrap()
         );
         admin_b
             .context
@@ -3983,6 +4792,68 @@ mod tests {
             Some(PacketType::Data as u8)
         );
         assert!(is_relay_data_zc_packet(&foreign_data_packet));
+    }
+
+    fn data_packet(from_peer_id: PeerId, to_peer_id: PeerId) -> ZCPacket {
+        let mut packet = ZCPacket::new_with_payload(b"data");
+        packet.fill_peer_manager_hdr(from_peer_id, to_peer_id, PacketType::Data as u8);
+        packet
+    }
+
+    #[test]
+    fn forged_attached_source_header_does_not_bypass_relay_disable() {
+        let packet = data_packet(77, 3);
+        for origin in [
+            PeerConnectionOrigin::Manual,
+            PeerConnectionOrigin::Direct,
+            PeerConnectionOrigin::Listener,
+            PeerConnectionOrigin::TcpHolePunch,
+            PeerConnectionOrigin::UdpHolePunch,
+        ] {
+            let network_ingress = PeerPacketIngress::Peer {
+                peer_id: 2,
+                conn_id: PeerConnId::new_v4(),
+                origin,
+            };
+
+            assert!(should_drop_relay_data(
+                true,
+                &packet,
+                1,
+                network_ingress,
+                false,
+            ));
+        }
+    }
+
+    #[test]
+    fn attached_ingress_and_destination_bypass_relay_disable() {
+        let packet = data_packet(2, 3);
+        let attached_ingress = PeerPacketIngress::Peer {
+            peer_id: 2,
+            conn_id: PeerConnId::new_v4(),
+            origin: PeerConnectionOrigin::Attached,
+        };
+        let network_ingress = PeerPacketIngress::Peer {
+            peer_id: 2,
+            conn_id: PeerConnId::new_v4(),
+            origin: PeerConnectionOrigin::Listener,
+        };
+
+        assert!(!should_drop_relay_data(
+            true,
+            &packet,
+            1,
+            attached_ingress,
+            false,
+        ));
+        assert!(!should_drop_relay_data(
+            true,
+            &packet,
+            1,
+            network_ingress,
+            true,
+        ));
     }
 
     fn route_with_ipv4(

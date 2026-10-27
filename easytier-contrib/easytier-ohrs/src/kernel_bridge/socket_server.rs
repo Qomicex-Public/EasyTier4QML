@@ -1,15 +1,15 @@
-use super::protocol::{
-    TunRequestPayload, broadcast_local_socket_json_payload_message, broadcast_local_socket_message,
-};
 use crate::collect_runtime_state_inner;
 use crate::config::repository::kernel_socket_path;
-use crate::kernel_bridge::routing::aggregate_tun_routes;
 use crate::runtime::state::runtime_state::{
     PeerConnInfo as RuntimePeerConnInfo, RuntimeAggregateState, peer_conn_to_view,
 };
 use crate::{ASYNC_RUNTIME, INSTANCE_MANAGER};
 use easytier::common::global_ctx::{EventBusSubscriber, GlobalCtxEvent};
 use easytier::instance::factory::subscribe_native_instance_event;
+use easytier_ohos_core::protocol::{
+    TunRequestPayload, broadcast_local_socket_json_payload_message, broadcast_local_socket_message,
+};
+use easytier_ohos_core::routing::aggregate_tun_routes;
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct LocalSocketState {
     stop_flag: std::sync::Arc<AtomicBool>,
@@ -38,6 +38,7 @@ const EVENT_RECEIVER_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TrafficStatsPayload {
+    sampled_at_ms: i64,
     instances: Vec<InstanceTrafficStats>,
 }
 
@@ -224,7 +225,7 @@ fn tun_candidate_ids(snapshot: &RuntimeAggregateState) -> HashSet<String> {
         .collect()
 }
 
-fn collect_traffic_stats() -> TrafficStatsPayload {
+fn collect_traffic_stats(sampled_at_ms: i64) -> TrafficStatsPayload {
     let running_instances = INSTANCE_MANAGER
         .instances()
         .into_iter()
@@ -285,7 +286,17 @@ fn collect_traffic_stats() -> TrafficStatsPayload {
         instances
     });
 
-    TrafficStatsPayload { instances }
+    TrafficStatsPayload {
+        sampled_at_ms,
+        instances,
+    }
+}
+
+fn unix_time_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or_default()
 }
 
 pub fn start_local_socket_server() -> bool {
@@ -409,7 +420,7 @@ pub fn start_local_socket_server() -> bool {
                 .unwrap_or(true);
             if should_collect_traffic_stats {
                 last_traffic_stats_at = Some(now);
-                match serde_json::to_string(&collect_traffic_stats()) {
+                match serde_json::to_string(&collect_traffic_stats(unix_time_millis())) {
                     Ok(json) => {
                         let _ = broadcast_local_socket_json_payload_message(
                             &mut clients,

@@ -1,6 +1,10 @@
 pub(crate) mod compressor;
+pub(crate) mod flow;
 mod hole_punch;
+pub(crate) mod ip;
 pub mod stun;
+
+pub use flow::FlowKey;
 
 pub(crate) use hole_punch::{
     HOLE_PUNCH_PACKET_BODY_LEN, hole_punch_packet_tid, new_hole_punch_packet,
@@ -114,9 +118,9 @@ bitflags::bitflags! {
         const NO_PROXY = 0b0000_1000;
         const COMPRESSED = 0b0001_0000;
         // deprecated flags, can be reused.
-        // const KCP_SRC_MODIFIED = 0b0010_0000;
-        // const QUIC_SRC_MODIFIED = 0b1000_0000;
+        const LIVENESS_PROBE = 0b0010_0000;
         const NOT_SEND_TO_TUN = 0b0100_0000;
+        const LIVENESS_ECHO = 0b1000_0000;
 
         const _ = !0;
     }
@@ -218,6 +222,44 @@ impl PeerManagerHeader {
         }
         self.flags = flags.bits();
         self
+    }
+
+    pub(crate) fn liveness_probe_token(&self) -> Option<u8> {
+        PeerManagerHeaderFlags::from_bits(self.flags)
+            .unwrap()
+            .contains(PeerManagerHeaderFlags::LIVENESS_PROBE)
+            .then_some(self.reserved)
+    }
+
+    pub(crate) fn liveness_echo_token(&self) -> Option<u8> {
+        PeerManagerHeaderFlags::from_bits(self.flags)
+            .unwrap()
+            .contains(PeerManagerHeaderFlags::LIVENESS_ECHO)
+            .then_some(self.reserved)
+    }
+
+    pub(crate) fn set_liveness_probe(&mut self, token: u8) {
+        self.set_liveness_marker(PeerManagerHeaderFlags::LIVENESS_PROBE, token);
+    }
+
+    pub(crate) fn set_liveness_echo(&mut self, token: u8) {
+        self.set_liveness_marker(PeerManagerHeaderFlags::LIVENESS_ECHO, token);
+    }
+
+    pub(crate) fn clear_liveness_marker(&mut self) {
+        let mut flags = PeerManagerHeaderFlags::from_bits(self.flags).unwrap();
+        flags
+            .remove(PeerManagerHeaderFlags::LIVENESS_PROBE | PeerManagerHeaderFlags::LIVENESS_ECHO);
+        self.flags = flags.bits();
+        self.reserved = 0;
+    }
+
+    fn set_liveness_marker(&mut self, marker: PeerManagerHeaderFlags, token: u8) {
+        self.clear_liveness_marker();
+        let mut flags = PeerManagerHeaderFlags::from_bits(self.flags).unwrap();
+        flags.insert(marker);
+        self.flags = flags.bits();
+        self.reserved = token;
     }
 
     pub fn mark_kcp_src_modified(&mut self) -> &mut Self {
@@ -501,6 +543,8 @@ impl ZCPacketType {
 pub struct ZCPacket {
     inner: BytesMut,
     packet_type: ZCPacketType,
+    /// Local scheduling metadata; never serialized into a tunnel packet.
+    pub(crate) flow_key: Option<FlowKey>,
 }
 
 impl ZCPacket {
@@ -516,6 +560,7 @@ impl ZCPacket {
         Self {
             inner: BytesMut::new(),
             packet_type: ZCPacketType::NIC,
+            flow_key: None,
         }
     }
 
@@ -523,6 +568,7 @@ impl ZCPacket {
         Self {
             inner: buf,
             packet_type,
+            flow_key: None,
         }
     }
 
@@ -570,6 +616,7 @@ impl ZCPacket {
             .copy_from_slice(foreign_zc_packet.tunnel_payload());
 
         ret.fill_peer_manager_hdr(0, 0, PacketType::ForeignNetworkPacket as u8);
+        ret.flow_key = foreign_zc_packet.flow_key;
 
         ret
     }
@@ -745,11 +792,14 @@ impl ZCPacket {
             let mut buf = BytesMut::with_capacity(new_pm_offset + tunnel_payload.len());
             unsafe { buf.set_len(new_pm_offset) };
             buf.extend_from_slice(tunnel_payload);
-            return Self::new_from_buf(buf, target_packet_type);
+            let mut packet = Self::new_from_buf(buf, target_packet_type);
+            packet.flow_key = self.flow_key;
+            return packet;
         }
 
         self.inner.advance(new_offset);
-        Self::new_from_buf(self.inner, target_packet_type)
+        self.packet_type = target_packet_type;
+        self
     }
 
     pub fn into_bytes(self) -> Bytes {
@@ -801,13 +851,15 @@ impl ZCPacket {
         let hdr = self.foreign_network_hdr().unwrap();
         let foreign_hdr_len = hdr.get_header_len();
 
-        Self::new_from_buf(
+        let mut packet = Self::new_from_buf(
             {
                 self.inner.advance(foreign_hdr_len + self.payload_offset());
                 self.inner
             },
             ZCPacketType::DummyTunnel,
-        )
+        );
+        packet.flow_key = self.flow_key;
+        packet
     }
 
     pub fn get_src_peer_id(&self) -> Option<u32> {

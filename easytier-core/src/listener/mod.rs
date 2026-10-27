@@ -15,6 +15,14 @@ use crate::{
 };
 
 pub mod plan;
+#[cfg(any(
+    test,
+    all(
+        feature = "wasm-host-tunnel",
+        not(feature = "wasm-host-tunnel-outbound")
+    )
+))]
+pub(crate) mod queue;
 pub mod transport;
 
 pub trait ExternalListenerFactory<Accepted>: Send + Sync + 'static
@@ -34,6 +42,10 @@ pub struct ExternalListenerRequest {
     pub url: Url,
     pub socket_context: SocketContext,
 }
+
+/// One listener supplied by the Host rather than the portable TOML model.
+/// Host listeners are mandatory: startup fails when one cannot bind.
+pub type HostListenerRegistration = ExternalListenerRequest;
 
 #[async_trait]
 pub trait AcceptedSocketHandler<Accepted>: Send + Sync {
@@ -133,7 +145,6 @@ impl<Accepted> ListenerFactory<Accepted> {
 
 #[derive(Debug, Clone)]
 pub struct ListenerManagerOptions {
-    pub max_listen_retries: usize,
     pub listen_retry_delay: Duration,
     pub accept_retry_delay: Duration,
 }
@@ -141,9 +152,8 @@ pub struct ListenerManagerOptions {
 impl Default for ListenerManagerOptions {
     fn default() -> Self {
         Self {
-            max_listen_retries: 5,
-            listen_retry_delay: Duration::from_secs(1),
-            accept_retry_delay: Duration::from_secs(1),
+            listen_retry_delay: Duration::from_millis(100),
+            accept_retry_delay: Duration::from_millis(100),
         }
     }
 }
@@ -330,10 +340,11 @@ where
     Accepted: Send + 'static,
 {
     let mut listener = creator();
-    match listener.listen().await {
-        Ok(()) => Ok(listener),
-        Err(error) => Err(error),
-    }
+    listener
+        .listen()
+        .await
+        .with_context(|| format!("failed to listen on {}", listener.local_url()))?;
+    Ok(listener)
 }
 
 async fn run_listener<Accepted, H>(
@@ -348,7 +359,7 @@ async fn run_listener<Accepted, H>(
     Accepted: Send + 'static,
     H: AcceptedSocketHandler<Accepted> + ?Sized + 'static,
 {
-    let mut listen_error_count = 0;
+    let mut listen_error_count: usize = 0;
     loop {
         let registered_listener = match initial_listener.take() {
             Some(listener) => listener,
@@ -360,18 +371,15 @@ async fn run_listener<Accepted, H>(
                         RegisteredListener::new(listener, events.clone(), registry.clone())
                     }
                     Err(error) => {
-                        listen_error_count += 1;
-                        let will_retry = listen_error_count <= options.max_listen_retries;
+                        listen_error_count = listen_error_count.saturating_add(1);
                         events.emit(CoreEvent::ListenerAddFailed {
                             url: listener.local_url(),
                             error: format!("{error:?}"),
                             retry_count: listen_error_count,
-                            will_retry,
+                            will_retry: true,
                         });
                         tracing::error!(?error, ?listener, "listener listen error");
-                        if !will_retry {
-                            return;
-                        }
+                        drop(listener);
                         crate::foundation::time::sleep(options.listen_retry_delay).await;
                         continue;
                     }
@@ -379,7 +387,7 @@ async fn run_listener<Accepted, H>(
             }
         };
         let mut listener = registered_listener.listener;
-        let _registration = registered_listener.registration;
+        let registration = registered_listener.registration;
 
         loop {
             let listener_url = listener.local_url();
@@ -391,7 +399,6 @@ async fn run_listener<Accepted, H>(
                         error: format!("{error:?}"),
                     });
                     tracing::error!(?error, ?listener, "listener accept error");
-                    crate::foundation::time::sleep(options.accept_retry_delay).await;
                     break;
                 }
             };
@@ -410,6 +417,9 @@ async fn run_listener<Accepted, H>(
                 }
             });
         }
+        drop(listener);
+        drop(registration);
+        crate::foundation::time::sleep(options.accept_retry_delay).await;
     }
 }
 
@@ -418,6 +428,8 @@ async fn run_accepted_task_runner(
     handler_tasks: Arc<Mutex<JoinSet<()>>>,
     cancel: CancellationToken,
 ) {
+    // Preserve the reaping deadline when new accepts win the select.
+    let mut reap_interval = crate::foundation::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -429,7 +441,7 @@ async fn run_accepted_task_runner(
                     None => break,
                 }
             }
-            _ = crate::foundation::time::sleep(Duration::from_secs(1)) => {
+            _ = reap_interval.tick() => {
                 let mut handler_tasks = handler_tasks.lock().await;
                 while let Some(task) = handler_tasks.try_join_next() {
                     if let Err(error) = task {
@@ -636,7 +648,6 @@ mod tests {
             ListenerManagerOptions {
                 accept_retry_delay: Duration::from_millis(1),
                 listen_retry_delay: Duration::from_millis(1),
-                max_listen_retries: 0,
             },
         );
 
@@ -689,7 +700,6 @@ mod tests {
             ListenerManagerOptions {
                 accept_retry_delay: Duration::from_millis(1),
                 listen_retry_delay: Duration::from_millis(1),
-                max_listen_retries: 2,
             },
         );
 
@@ -736,7 +746,6 @@ mod tests {
             ListenerManagerOptions {
                 accept_retry_delay: Duration::from_millis(1),
                 listen_retry_delay: Duration::from_millis(1),
-                max_listen_retries: 0,
             },
         );
 
@@ -768,7 +777,8 @@ mod tests {
             true,
         );
 
-        assert!(manager.run().await.is_err());
+        let error = manager.run().await.unwrap_err();
+        assert!(format!("{error:#}").contains("mock://second"));
         crate::foundation::time::sleep(Duration::from_millis(20)).await;
         assert!(handler.accepted.lock().unwrap().is_empty());
         assert!(
@@ -799,7 +809,6 @@ mod tests {
             ListenerManagerOptions {
                 accept_retry_delay: Duration::from_millis(1),
                 listen_retry_delay: Duration::from_millis(1),
-                max_listen_retries: 0,
             },
         );
 
@@ -877,6 +886,40 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn continuous_accepts_do_not_prevent_completed_handler_reaping() {
+        let (spawner, rx) = AcceptedTaskSpawner::new();
+        let handler_tasks = Arc::new(tokio::sync::Mutex::new(JoinSet::new()));
+        let cancel = CancellationToken::new();
+        let runner = tokio::spawn(run_accepted_task_runner(
+            rx,
+            handler_tasks.clone(),
+            cancel.clone(),
+        ));
+
+        // Keep accepting more frequently than the one-second reaping period.
+        // Waiting for completion ensures that retained entries are finished tasks.
+        for _ in 0..100 {
+            let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+            spawner.spawn(async move {
+                completed_tx.send(()).unwrap();
+            });
+            completed_rx.await.unwrap();
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+
+        let retained = handler_tasks.lock().await.len();
+        cancel.cancel();
+        runner.await.unwrap();
+
+        assert!(
+            retained <= 10,
+            "continuous accepts retained {retained} completed handlers"
+        );
+        assert!(handler_tasks.lock().await.is_empty());
+    }
+
     #[tokio::test]
     async fn stop_joins_in_flight_handler_tasks_and_is_one_shot() {
         let (drop_tx, drop_rx) = tokio::sync::oneshot::channel();
@@ -886,7 +929,6 @@ mod tests {
             ListenerManagerOptions {
                 accept_retry_delay: Duration::from_millis(1),
                 listen_retry_delay: Duration::from_millis(1),
-                max_listen_retries: 0,
             },
         );
         let accepts = Arc::new(Mutex::new(VecDeque::from([Ok::<_, anyhow::Error>(
@@ -949,12 +991,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listen_retry_exhaustion_keeps_in_flight_handler_tasks_until_manager_drop() {
+    async fn listen_recovery_keeps_in_flight_handler_tasks_until_manager_drop() {
         let (drop_tx, mut drop_rx) = tokio::sync::oneshot::channel();
-        let listen_results = Arc::new(Mutex::new(VecDeque::from([
-            Ok(()),
-            Err(anyhow::anyhow!("bind failed")),
-        ])));
+        let listen_results = Arc::new(Mutex::new(
+            std::iter::once(Ok(()))
+                .chain((0..8).map(|_| Err(anyhow::anyhow!("bind failed"))))
+                .collect::<VecDeque<_>>(),
+        ));
         let accepts = Arc::new(Mutex::new(VecDeque::from([
             Ok::<_, anyhow::Error>(DropSignal(Some(drop_tx))),
             Err(anyhow::anyhow!("accept failed")),
@@ -966,7 +1009,6 @@ mod tests {
             ListenerManagerOptions {
                 accept_retry_delay: Duration::from_millis(1),
                 listen_retry_delay: Duration::from_millis(1),
-                max_listen_retries: 0,
             },
         );
         let listener_results = listen_results.clone();
@@ -974,7 +1016,7 @@ mod tests {
         manager.add_listener(
             move || {
                 Box::new(DropSignalListener {
-                    url: "mock://retry-exhausted".parse().unwrap(),
+                    url: "mock://retrying".parse().unwrap(),
                     listen_results: listener_results.clone(),
                     accepts: listener_accepts.clone(),
                 })
@@ -985,15 +1027,22 @@ mod tests {
         manager.run().await.unwrap();
         crate::foundation::time::timeout(Duration::from_secs(1), async {
             loop {
-                if events.events.lock().unwrap().iter().any(|event| {
-                    matches!(
+                let recovered = {
+                    let events = events.events.lock().unwrap();
+                    assert!(events.iter().all(|event| !matches!(
                         event,
                         CoreEvent::ListenerAddFailed {
                             will_retry: false,
                             ..
                         }
-                    )
-                }) {
+                    )));
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, CoreEvent::ListenerAdded { .. }))
+                        .count()
+                        == 2
+                };
+                if recovered {
                     break;
                 }
                 crate::foundation::time::sleep(Duration::from_millis(1)).await;

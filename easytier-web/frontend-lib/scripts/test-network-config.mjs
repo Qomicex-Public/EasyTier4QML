@@ -20,12 +20,13 @@ const {
   DEFAULT_NETWORK_CONFIG,
   NetworkingMethod,
   normalizeNetworkConfig,
+  normalizeVpnPortalInfo,
   toBackendNetworkConfig,
 } = NetworkTypes
 
 const BOOLEAN_CONFIG_FIELDS = [
   'dhcp',
-  'enable_vpn_portal',
+  'dhcpv6',
   'advanced_settings',
   'latency_first',
   'use_smoltcp',
@@ -58,6 +59,13 @@ const BOOLEAN_CONFIG_FIELDS = [
   'disable_relay_data',
   'enable_udp_broadcast_relay',
   'disable_tcp_hole_punching',
+]
+
+const LEGACY_VPN_PORTAL_FIELDS = [
+  'enable_vpn_portal',
+  'vpn_portal_listen_port',
+  'vpn_portal_client_network_addr',
+  'vpn_portal_client_network_len',
 ]
 
 function readGeneratedNetworkConfigFields() {
@@ -106,6 +114,9 @@ function allFieldFixture() {
     ...DEFAULT_NETWORK_CONFIG(),
     instance_id: '11111111-2222-3333-4444-555555555555',
     dhcp: false,
+    dhcp_ipv4_cidr: '10.9.8.0/25',
+    dhcpv6: true,
+    dhcp_ipv6_cidr: 'fd12::/64',
     virtual_ipv4: '10.9.8.7',
     network_length: 25,
     hostname: 'frontend-e2e',
@@ -121,10 +132,15 @@ function allFieldFixture() {
       },
     ],
     proxy_cidrs: ['10.10.0.0/16', '192.168.2.0/24->10.99.0.0/24'],
-    enable_vpn_portal: true,
-    vpn_portal_listen_port: 23000,
-    vpn_portal_client_network_addr: '10.88.0.0',
-    vpn_portal_client_network_len: 24,
+    vpn_portal_config: {
+      wireguard_listen: '0.0.0.0:23000',
+      wireguard_private_key: 'portal-private-key',
+      clients: [{
+        name: 'phone-a',
+        virtual_ip: '10.9.8.10',
+        groups: ['ops'],
+      }],
+    },
     advanced_settings: true,
     listener_urls: ['tcp://0.0.0.0:12010', 'udp://0.0.0.0:12010'],
     latency_first: true,
@@ -224,8 +240,20 @@ function allFieldFixture() {
       },
     },
     credential_file: '/tmp/easytier-credential.toml',
+    managed_credentials: [
+      {
+        credential_id: 'managed-credential',
+        credential_secret: 'managed-secret',
+        groups: ['ops'],
+        allow_relay: true,
+        allowed_proxy_cidrs: ['10.30.0.0/16'],
+        expiry_unix: '1791971218',
+        reusable: true,
+      },
+    ],
     lazy_p2p: true,
     need_p2p: true,
+    prefer_peer_relay: true,
     instance_recv_bps_limit: '9007199254740993',
     disable_upnp: true,
     ipv6_public_addr_provider: true,
@@ -239,6 +267,7 @@ function allFieldFixture() {
 
 function assertFixtureCoversGeneratedFields() {
   const generatedFields = readGeneratedNetworkConfigFields()
+    .filter((field) => !LEGACY_VPN_PORTAL_FIELDS.includes(field))
   const fixtureFields = new Set(Object.keys(allFieldFixture()))
   const missing = generatedFields.filter((field) => !fixtureFields.has(field))
 
@@ -258,7 +287,8 @@ function assertFullFieldRoundTrip() {
   const backend = toBackendNetworkConfig(normalized)
   expectNoCamelCaseKeys(backend)
 
-  for (const field of readGeneratedNetworkConfigFields()) {
+  for (const field of readGeneratedNetworkConfigFields()
+    .filter((field) => !LEGACY_VPN_PORTAL_FIELDS.includes(field))) {
     assert.ok(field in backend, `backend JSON should include fixture field ${field}`)
   }
 
@@ -269,6 +299,9 @@ function assertFullFieldRoundTrip() {
   assert.deepEqual(backend.peers[1], { uri: 'udp://peer-b:11010' })
   assert.equal(backend.data_compress_algo, 'Zstd')
   assert.equal(backend.instance_recv_bps_limit, '9007199254740993')
+  assert.equal(backend.vpn_portal_config.wireguard_listen, '0.0.0.0:23000')
+  assert.equal(backend.vpn_portal_config.clients[0].name, 'phone-a')
+  assert.deepEqual(backend.vpn_portal_config.clients[0].groups, ['ops'])
   assert.equal(backend.secure_mode.enabled, true)
   assert.equal(backend.secure_mode.local_private_key, 'private-key')
   assert.equal(backend.acl.acl_v1.chains[0].chain_type, 'Forward')
@@ -277,6 +310,38 @@ function assertFullFieldRoundTrip() {
   assert.equal(backend.acl.acl_v1.chains[0].rules[0].action, 'Allow')
   assert.equal(backend.port_forwards[1].proto, 'udp')
   assert.equal(backend.socket_mark, 1234)
+}
+
+function assertLegacyVpnPortalFieldsReachBackendValidation() {
+  const backend = toBackendNetworkConfig({
+    ...DEFAULT_NETWORK_CONFIG(),
+    enable_vpn_portal: true,
+    vpn_portal_listen_port: 22022,
+    vpn_portal_client_network_addr: '10.88.0.0',
+    vpn_portal_client_network_len: 24,
+  })
+
+  assert.equal(backend.enable_vpn_portal, true)
+  assert.equal(backend.vpn_portal_listen_port, 22022)
+  assert.equal(backend.vpn_portal_client_network_addr, '10.88.0.0')
+  assert.equal(backend.vpn_portal_client_network_len, 24)
+}
+
+function assertVpnPortalRpcJsonNormalization() {
+  const info = normalizeVpnPortalInfo({
+    vpn_type: 'wireguard',
+    listener: '0.0.0.0:22022',
+    clients: [{
+      name: 'phone-a',
+      virtual_ip: '10.9.8.10',
+      groups: ['ops'],
+      state: 'VPN_PORTAL_CLIENT_STATE_ONLINE',
+      client_config: '[Interface]',
+    }],
+  })
+
+  assert.equal(info.clients[0].state, 3)
+  assert.deepEqual(info.connected_clients, [])
 }
 
 function assertBooleanFieldValuesPreserved() {
@@ -526,6 +591,8 @@ function assertNumberBoundaries() {
 const tests = [
   assertFixtureCoversGeneratedFields,
   assertFullFieldRoundTrip,
+  assertLegacyVpnPortalFieldsReachBackendValidation,
+  assertVpnPortalRpcJsonNormalization,
   assertBooleanFieldValuesPreserved,
   assertEnumCompatibility,
   assertAclDefaultsAndExplicitZero,

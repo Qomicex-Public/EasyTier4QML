@@ -13,7 +13,7 @@ use cidr::{Ipv4Cidr, Ipv4Inet, Ipv6Cidr, Ipv6Inet};
 use dashmap::DashMap;
 use easytier_proto::{
     acl::Acl,
-    common::{FlagsInConfig, PeerFeatureFlag, SecureModeConfig, StunInfo, TunnelInfo},
+    common::{Flags, PeerFeatureFlag, SecureModeConfig, StunInfo, TunnelInfo},
     peer_rpc::{PeerGroupInfo, TrustedCredentialPubkeyProof},
 };
 use hmac::{Hmac, Mac};
@@ -28,6 +28,7 @@ use crate::{
         RouteConfig, TrafficConfig,
     },
     events::{CoreEvent, CoreEventSink},
+    foundation::small_map_shard_amount,
     foundation::stats::{LabelSet, LabelType, MetricName, StatsManager},
     foundation::token_bucket::{ArcByteLimiter, BucketConfig, TokenBucketManager},
     peers::{
@@ -71,12 +72,11 @@ pub struct PeerRuntimeSnapshotInput {
     pub routes: RouteConfig,
     pub network_identity: NetworkIdentity,
     pub stun_info: StunInfo,
-    pub flags: FlagsInConfig,
+    pub flags: Flags,
     pub secure_mode: Option<SecureModeConfig>,
     pub host_routing: HostRoutingPolicy,
     pub acl: Option<Acl>,
     pub easytier_version: String,
-    pub vpn_portal_cidr: Option<Ipv4Cidr>,
     pub pinned_peers: Vec<(url::Url, Option<String>)>,
     pub ospf_update_my_foreign_network_interval_sec: u64,
     pub max_direct_conns_per_peer_in_foreign_network: usize,
@@ -90,7 +90,7 @@ struct PeerTrafficLimits {
 }
 
 impl PeerTrafficLimits {
-    fn from_portable(runtime: &PeerRuntimeConfig, flags: &FlagsInConfig) -> Self {
+    fn from_portable(runtime: &PeerRuntimeConfig, flags: &Flags) -> Self {
         let traffic = &runtime.core.traffic;
         Self {
             instance_recv_bps: Self::normalize(
@@ -126,7 +126,6 @@ impl PeerRuntimeSnapshot {
             host_routing,
             acl,
             easytier_version,
-            vpn_portal_cidr,
             pinned_peers,
             ospf_update_my_foreign_network_interval_sec,
             max_direct_conns_per_peer_in_foreign_network,
@@ -183,7 +182,6 @@ impl PeerRuntimeSnapshot {
             easytier_version,
             avoid_relay_data_preference,
             flags,
-            vpn_portal_cidr,
             pinned_peers,
             peer_group_memberships,
             acl_group_declarations,
@@ -331,6 +329,10 @@ impl CorePeerContext {
         self.config.snapshot().peer.clone()
     }
 
+    pub(crate) fn runtime_config_store(&self) -> CoreRuntimeConfigStore {
+        self.config.clone()
+    }
+
     pub fn stats_manager(&self) -> Arc<StatsManager> {
         self.stats_manager.clone()
     }
@@ -437,7 +439,7 @@ pub(crate) struct TrustedKeyMapManager {
 impl TrustedKeyMapManager {
     pub fn new() -> Self {
         Self {
-            network_trusted_keys: DashMap::new(),
+            network_trusted_keys: DashMap::with_shard_amount(small_map_shard_amount()),
         }
     }
 
@@ -526,7 +528,7 @@ pub(crate) struct PeerPacketPolicy {
 }
 
 impl PeerPacketPolicy {
-    fn from_flags(flags: &FlagsInConfig) -> Self {
+    fn from_flags(flags: &Flags) -> Self {
         Self {
             disable_relay_data: flags.disable_relay_data,
             p2p_only: flags.p2p_only,
@@ -548,8 +550,8 @@ pub(crate) trait PeerContext: Send + Sync {
         self.network_identity().network_name
     }
 
-    fn flags(&self) -> FlagsInConfig {
-        FlagsInConfig::default()
+    fn flags(&self) -> Flags {
+        Flags::default()
     }
 
     fn packet_policy(&self) -> PeerPacketPolicy {
@@ -602,10 +604,6 @@ pub(crate) trait PeerContext: Send + Sync {
 
     fn proxy_networks(&self) -> Vec<ProxyNetworkConfig> {
         Vec::new()
-    }
-
-    fn vpn_portal_cidr(&self) -> Option<Ipv4Cidr> {
-        None
     }
 
     fn hostname(&self) -> String {
@@ -746,7 +744,7 @@ impl PeerContext for CorePeerContext {
         self.snapshot().runtime.network_identity.clone()
     }
 
-    fn flags(&self) -> FlagsInConfig {
+    fn flags(&self) -> Flags {
         self.snapshot().flags.clone()
     }
 
@@ -821,10 +819,6 @@ impl PeerContext for CorePeerContext {
 
     fn proxy_networks(&self) -> Vec<ProxyNetworkConfig> {
         self.snapshot().runtime.core.routes.proxy_networks.clone()
-    }
-
-    fn vpn_portal_cidr(&self) -> Option<Ipv4Cidr> {
-        self.snapshot().vpn_portal_cidr
     }
 
     fn hostname(&self) -> String {
@@ -1089,7 +1083,7 @@ pub(crate) mod tests {
     }
 
     fn submitted_snapshot(hostname: &str, disable_relay_data: bool) -> PeerRuntimeSnapshot {
-        let mut flags = FlagsInConfig::default();
+        let mut flags = Flags::default();
         flags.disable_relay_data = disable_relay_data;
         PeerRuntimeSnapshot::new(
             PeerRuntimeConfig {
@@ -1110,7 +1104,7 @@ pub(crate) mod tests {
         )
     }
 
-    fn host_snapshot_input(flags: FlagsInConfig, acl: Option<Acl>) -> PeerRuntimeSnapshotInput {
+    fn host_snapshot_input(flags: Flags, acl: Option<Acl>) -> PeerRuntimeSnapshotInput {
         PeerRuntimeSnapshotInput {
             node: NodeConfig {
                 peer_id: None,
@@ -1131,7 +1125,6 @@ pub(crate) mod tests {
             },
             acl,
             easytier_version: "host-version".to_owned(),
-            vpn_portal_cidr: Some("10.30.0.0/24".parse().unwrap()),
             pinned_peers: vec![(
                 "tcp://192.0.2.10:11010".parse().unwrap(),
                 Some("peer-key".to_owned()),
@@ -1144,7 +1137,7 @@ pub(crate) mod tests {
 
     #[test]
     fn host_input_derives_peer_policy_features_and_traffic() {
-        let mut flags = FlagsInConfig::default();
+        let mut flags = Flags::default();
         flags.disable_p2p = true;
         flags.need_p2p = true;
         flags.relay_all_peer_rpc = true;
@@ -1204,17 +1197,13 @@ pub(crate) mod tests {
                 }),
             }),
         };
-        let mut flags = FlagsInConfig::default();
+        let mut flags = Flags::default();
         flags.relay_network_whitelist = "other-network".to_owned();
 
         let snapshot = PeerRuntimeSnapshot::from_host_input(host_snapshot_input(flags, Some(acl)));
 
         assert!(snapshot.avoid_relay_data_preference);
         assert_eq!(snapshot.easytier_version, "host-version");
-        assert_eq!(
-            snapshot.vpn_portal_cidr,
-            Some("10.30.0.0/24".parse().unwrap())
-        );
         assert_eq!(
             snapshot.pinned_peers,
             vec![(
@@ -1286,7 +1275,7 @@ pub(crate) mod tests {
         let mut runtime = PeerRuntimeSnapshot::default().runtime;
         runtime.core.traffic.instance_recv_bps_limit = Some(0);
         runtime.core.traffic.foreign_relay_bps_limit = Some(2048);
-        let mut flags = FlagsInConfig::default();
+        let mut flags = Flags::default();
         flags.instance_recv_bps_limit = 1024;
         flags.foreign_relay_bps_limit = 4096;
 
@@ -1299,7 +1288,7 @@ pub(crate) mod tests {
     #[test]
     fn legacy_traffic_limits_ignore_unlimited_sentinels() {
         let runtime = PeerRuntimeSnapshot::default().runtime;
-        let mut flags = FlagsInConfig::default();
+        let mut flags = Flags::default();
         flags.instance_recv_bps_limit = 1024;
         flags.foreign_relay_bps_limit = u64::MAX;
 
@@ -1314,7 +1303,7 @@ pub(crate) mod tests {
         let mut runtime = PeerRuntimeSnapshot::default().runtime;
         runtime.core.traffic.instance_recv_bps_limit = Some(u64::MAX);
         runtime.core.traffic.foreign_relay_bps_limit = Some(u64::MAX);
-        let mut flags = FlagsInConfig::default();
+        let mut flags = Flags::default();
         flags.instance_recv_bps_limit = 1024;
         flags.foreign_relay_bps_limit = 2048;
 
@@ -1327,7 +1316,7 @@ pub(crate) mod tests {
     fn portable_traffic_limits_default_to_unlimited() {
         let runtime = PeerRuntimeSnapshot::default().runtime;
 
-        let snapshot = PeerRuntimeSnapshot::new(runtime, FlagsInConfig::default());
+        let snapshot = PeerRuntimeSnapshot::new(runtime, Flags::default());
 
         assert_eq!(snapshot.traffic_limits(), PeerTrafficLimits::default());
     }
@@ -1562,7 +1551,7 @@ pub(crate) mod tests {
                 local_exit_node_fallback: true,
             },
         };
-        let mut flags = FlagsInConfig::default();
+        let mut flags = Flags::default();
         flags.p2p_only = true;
         let acl = Acl {
             acl_v1: Some(easytier_proto::acl::AclV1 {
@@ -1638,7 +1627,7 @@ pub(crate) mod tests {
         live.tcp_nat_type = 4;
         let context = core_owned_context(
             runtime,
-            FlagsInConfig::default(),
+            Flags::default(),
             Some(Arc::new(TestStunInfoSource(live.clone()))),
         );
 
@@ -1648,7 +1637,7 @@ pub(crate) mod tests {
 
     fn core_owned_context(
         runtime: PeerRuntimeConfig,
-        flags: FlagsInConfig,
+        flags: Flags,
         stun_info_source: Option<Arc<dyn PeerStunInfoSource>>,
     ) -> CorePeerContext {
         core_owned_context_with_acl(runtime, flags, stun_info_source, None)
@@ -1656,7 +1645,7 @@ pub(crate) mod tests {
 
     fn core_owned_context_with_acl(
         runtime: PeerRuntimeConfig,
-        flags: FlagsInConfig,
+        flags: Flags,
         stun_info_source: Option<Arc<dyn PeerStunInfoSource>>,
         acl: Option<&Acl>,
     ) -> CorePeerContext {
@@ -1691,7 +1680,7 @@ pub(crate) mod tests {
                 secure_mode: None,
                 host_routing: HostRoutingPolicy::default(),
             },
-            FlagsInConfig::default(),
+            Flags::default(),
             None,
         )
     }

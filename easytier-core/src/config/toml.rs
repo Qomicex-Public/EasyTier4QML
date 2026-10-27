@@ -6,179 +6,22 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use super::{DhcpConfig, normalize_secure_mode_config};
 pub use super::{EncryptionAlgorithm, gateway::PortForwardConfig};
 use anyhow::Context;
 #[cfg(feature = "rich-config-errors")]
 use ariadne::{CharSet, Config as AriadneConfig, IndexType, Label, Report, ReportKind, Source};
+use optionize::Optionizable;
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "config-write")]
-use crate::config::{DEFAULT_UDP_STUN_SERVERS, DEFAULT_UDP_V6_STUN_SERVERS, default_stun_servers};
-use crate::proto::{
-    acl::Acl,
-    common::{CompressionAlgoPb, SecureModeConfig},
-};
+use crate::proto::{acl::Acl, common::SecureModeConfig};
 
 pub const DEFAULT_ET_DNS_ZONE: &str = "et.net.";
 
-pub type Flags = crate::proto::common::FlagsInConfig;
+pub use crate::proto::common::{Flags, FlagsPatch};
 
 pub(crate) fn default_instance_name() -> String {
     "default".to_owned()
-}
-
-#[cfg(feature = "config-write")]
-fn default_udp_stun_servers() -> Vec<String> {
-    default_stun_servers(DEFAULT_UDP_STUN_SERVERS)
-}
-
-#[cfg(feature = "config-write")]
-fn default_udp_v6_stun_servers() -> Vec<String> {
-    default_stun_servers(DEFAULT_UDP_V6_STUN_SERVERS)
-}
-
-pub fn gen_default_flags() -> Flags {
-    #[allow(deprecated)]
-    Flags {
-        default_protocol: "tcp".to_string(),
-        dev_name: "".to_string(),
-        enable_encryption: true,
-        enable_ipv6: true,
-        mtu: 1380,
-        latency_first: false,
-        enable_exit_node: false,
-        proxy_forward_by_system: false,
-        no_tun: false,
-        use_smoltcp: false,
-        relay_network_whitelist: "*".to_string(),
-        disable_p2p: false,
-        p2p_only: false,
-        lazy_p2p: false,
-        relay_all_peer_rpc: false,
-        disable_tcp_hole_punching: false,
-        disable_udp_hole_punching: false,
-        multi_thread: true,
-        data_compress_algo: CompressionAlgoPb::None.into(),
-        bind_device: true,
-        enable_kcp_proxy: false,
-        disable_kcp_input: false,
-        disable_relay_kcp: false,
-        enable_relay_foreign_network_kcp: false,
-        accept_dns: false,
-        private_mode: false,
-        enable_quic_proxy: false,
-        disable_quic_input: false,
-        disable_relay_quic: false,
-        enable_relay_foreign_network_quic: false,
-        foreign_relay_bps_limit: u64::MAX,
-        multi_thread_count: 2,
-        encryption_algorithm: EncryptionAlgorithm::default().to_string(),
-        disable_sym_hole_punching: false,
-        tld_dns_zone: DEFAULT_ET_DNS_ZONE.to_string(),
-
-        quic_listen_port: u32::MAX,
-        need_p2p: false,
-        instance_recv_bps_limit: u64::MAX,
-        disable_upnp: false,
-        disable_relay_data: false,
-        enable_udp_broadcast_relay: false,
-        socket_mark: None,
-    }
-}
-
-#[cfg(feature = "config-write")]
-macro_rules! define_flags_diff {
-    (
-        fields: [$($field:ident),* $(,)?],
-        u64s: [$($u64_field:ident),* $(,)?],
-        enums: [$($enum_field:ident),* $(,)?]
-    ) => {
-        #[allow(deprecated)]
-        fn flags_diff_from_default(flags: &Flags) -> serde_json::Map<String, serde_json::Value> {
-            let defaults = gen_default_flags();
-            let mut changed = serde_json::Map::new();
-            $(
-                if flags.$field != defaults.$field {
-                    changed.insert(
-                        stringify!($field).to_owned(),
-                        serde_json::to_value(&flags.$field)
-                            .expect("FlagsInConfig field should serialize to JSON"),
-                    );
-                }
-            )*
-            $(
-                if flags.$u64_field != defaults.$u64_field {
-                    changed.insert(
-                        stringify!($u64_field).to_owned(),
-                        serde_json::json!(flags.$u64_field.to_string()),
-                    );
-                }
-            )*
-            $(
-                if flags.$enum_field != defaults.$enum_field {
-                    let value = CompressionAlgoPb::try_from(flags.$enum_field)
-                        .map(|value| serde_json::to_value(value).expect("enum should serialize"))
-                        .unwrap_or_else(|_| serde_json::json!(flags.$enum_field));
-                    changed.insert(stringify!($enum_field).to_owned(), value);
-                }
-            )*
-            changed
-        }
-
-        #[cfg(all(test, feature = "config-write"))]
-        const FLAGS_DIFF_FIELDS: &[&str] = &[
-            $(stringify!($field),)*
-            $(stringify!($u64_field),)*
-            $(stringify!($enum_field),)*
-        ];
-    };
-}
-
-#[cfg(feature = "config-write")]
-define_flags_diff! {
-    fields: [
-        default_protocol,
-        dev_name,
-        enable_encryption,
-        enable_ipv6,
-        mtu,
-        latency_first,
-        enable_exit_node,
-        no_tun,
-        use_smoltcp,
-        relay_network_whitelist,
-        disable_p2p,
-        relay_all_peer_rpc,
-        disable_udp_hole_punching,
-        multi_thread,
-        bind_device,
-        enable_kcp_proxy,
-        disable_kcp_input,
-        disable_relay_kcp,
-        proxy_forward_by_system,
-        accept_dns,
-        private_mode,
-        enable_quic_proxy,
-        disable_quic_input,
-        disable_relay_quic,
-        quic_listen_port,
-        multi_thread_count,
-        enable_relay_foreign_network_kcp,
-        enable_relay_foreign_network_quic,
-        encryption_algorithm,
-        disable_sym_hole_punching,
-        tld_dns_zone,
-        p2p_only,
-        disable_tcp_hole_punching,
-        lazy_p2p,
-        need_p2p,
-        disable_upnp,
-        disable_relay_data,
-        enable_udp_broadcast_relay,
-        socket_mark,
-    ],
-    u64s: [foreign_relay_bps_limit, instance_recv_bps_limit],
-    enums: [data_compress_algo]
 }
 
 #[auto_impl::auto_impl(Box, &)]
@@ -210,8 +53,27 @@ pub trait ConfigLoader: Send + Sync {
     fn get_ipv6_public_addr_prefix(&self) -> Option<cidr::Ipv6Cidr>;
     fn set_ipv6_public_addr_prefix(&self, prefix: Option<cidr::Ipv6Cidr>);
 
-    fn get_dhcp(&self) -> bool;
-    fn set_dhcp(&self, dhcp: bool);
+    fn get_dhcp_config(&self) -> DhcpConfig;
+    fn set_dhcp_config(&self, dhcp: DhcpConfig);
+
+    fn get_dhcp(&self) -> bool {
+        self.get_dhcp_config().enabled()
+    }
+
+    fn set_dhcp(&self, dhcp: bool) {
+        self.set_dhcp_config(DhcpConfig::Enabled(dhcp));
+    }
+
+    fn get_dhcpv6_config(&self) -> DhcpConfig<cidr::Ipv6Cidr>;
+    fn set_dhcpv6_config(&self, dhcp: DhcpConfig<cidr::Ipv6Cidr>);
+
+    fn get_dhcpv6(&self) -> bool {
+        self.get_dhcpv6_config().enabled()
+    }
+
+    fn set_dhcpv6(&self, dhcp: bool) {
+        self.set_dhcpv6_config(DhcpConfig::Enabled(dhcp));
+    }
 
     fn add_proxy_cidr(
         &self,
@@ -240,7 +102,12 @@ pub trait ConfigLoader: Send + Sync {
     fn set_vpn_portal_config(&self, config: VpnPortalConfig);
 
     fn get_flags(&self) -> Flags;
+    /// Replace all flags with explicitly supplied values.
     fn set_flags(&self, flags: Flags);
+    /// The user-supplied values, before application defaults are resolved.
+    fn get_flags_patch(&self) -> FlagsPatch;
+    /// Apply only supplied fields, preserving absence and explicit defaults.
+    fn patch_flags(&self, flags: FlagsPatch);
 
     fn get_exit_nodes(&self) -> Vec<IpAddr>;
     fn set_exit_nodes(&self, nodes: Vec<IpAddr>);
@@ -266,6 +133,11 @@ pub trait ConfigLoader: Send + Sync {
     fn get_stun_servers(&self) -> Option<Vec<String>>;
     fn set_stun_servers(&self, servers: Option<Vec<String>>);
 
+    fn get_tcp_stun_servers(&self) -> Option<Vec<String>> {
+        None
+    }
+    fn set_tcp_stun_servers(&self, _servers: Option<Vec<String>>) {}
+
     fn get_stun_servers_v6(&self) -> Option<Vec<String>>;
     fn set_stun_servers_v6(&self, servers: Option<Vec<String>>);
 
@@ -277,12 +149,20 @@ pub trait ConfigLoader: Send + Sync {
     }
     fn set_credential_file(&self, _path: Option<std::path::PathBuf>) {}
 
+    fn get_managed_credentials(&self) -> Vec<ManagedCredentialConfig> {
+        Vec::new()
+    }
+    fn set_managed_credentials(&self, _credentials: Vec<ManagedCredentialConfig>) {}
+
     fn get_network_config_source(&self) -> ConfigSource {
         ConfigSource::User
     }
     fn set_network_config_source(&self, _source: Option<ConfigSource>) {}
 
     fn dump(&self) -> String;
+    fn dump_redacted(&self) -> String {
+        self.dump()
+    }
 }
 
 pub trait LoggingConfigLoader {
@@ -424,11 +304,11 @@ pub struct ConsoleLoggerConfig {
     pub level: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, derive_builder::Builder)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, bon::Builder)]
 pub struct LoggingConfig {
-    #[builder(setter(into, strip_option), default = None)]
+    #[builder(into)]
     pub file_logger: Option<FileLoggerConfig>,
-    #[builder(setter(into, strip_option), default = None)]
+    #[builder(into)]
     pub console_logger: Option<ConsoleLoggerConfig>,
 }
 
@@ -442,10 +322,86 @@ impl LoggingConfigLoader for &LoggingConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct VpnPortalConfig {
-    pub client_cidr: cidr::Ipv4Cidr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     pub wireguard_listen: SocketAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wireguard_private_key: Option<String>,
+    #[serde(default)]
+    pub clients: Vec<VpnPortalClientConfig>,
+}
+
+impl std::fmt::Debug for VpnPortalConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VpnPortalConfig")
+            .field("enabled", &self.enabled)
+            .field("wireguard_listen", &self.wireguard_listen)
+            .field(
+                "wireguard_private_key",
+                &self.wireguard_private_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("clients", &self.clients)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VpnPortalClientConfig {
+    pub name: String,
+    pub virtual_ip: cidr::Ipv4Inet,
+    #[serde(default)]
+    pub groups: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[optionize::optionized]
+#[cfg_attr(any(feature = "web-client", feature = "browser-config"), optionize(object = easytier_proto::api::manage::ManagedCredentialConfig))]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedCredentialConfig {
+    #[optionize(flatten)]
+    pub credential_id: String,
+    #[optionize(flatten)]
+    pub credential_secret: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[optionize(flatten)]
+    pub groups: Vec<String>,
+    #[serde(default)]
+    #[optionize(flatten)]
+    pub allow_relay: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[optionize(flatten)]
+    pub allowed_proxy_cidrs: Vec<String>,
+    #[optionize(flatten)]
+    pub expiry_unix: i64,
+    #[serde(default = "default_true")]
+    // The mapped field is `Option<bool>` (the protocol spells it `optional bool`),
+    // so this document default does not describe it.
+    #[optionize(attrs(.., -serde), default = |_| default_true())]
+    pub reusable: bool,
+}
+
+impl std::fmt::Debug for ManagedCredentialConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedCredentialConfig")
+            .field("credential_id", &self.credential_id)
+            .field("credential_secret", &"<redacted>")
+            .field("groups", &self.groups)
+            .field("allow_relay", &self.allow_relay)
+            .field("allowed_proxy_cidrs", &self.allowed_proxy_cidrs)
+            .field("expiry_unix", &self.expiry_unix)
+            .field("reusable", &self.reusable)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -460,7 +416,8 @@ struct Config {
     ipv6_public_addr_provider: Option<bool>,
     ipv6_public_addr_auto: Option<bool>,
     ipv6_public_addr_prefix: Option<String>,
-    dhcp: Option<bool>,
+    dhcp: Option<DhcpConfig>,
+    dhcpv6: Option<DhcpConfig<cidr::Ipv6Cidr>>,
     network_identity: Option<NetworkIdentity>,
     listeners: Option<Vec<url::Url>>,
     mapped_listeners: Option<Vec<url::Url>>,
@@ -479,19 +436,20 @@ struct Config {
 
     secure_mode: Option<SecureModeConfig>,
 
-    flags: Option<serde_json::Map<String, serde_json::Value>>,
-
-    #[serde(skip)]
-    flags_struct: Option<Flags>,
+    #[serde(default)]
+    flags: FlagsPatch,
 
     acl: Option<Acl>,
 
     tcp_whitelist: Option<Vec<String>>,
     udp_whitelist: Option<Vec<String>>,
     stun_servers: Option<Vec<String>>,
+    tcp_stun_servers: Option<Vec<String>>,
     stun_servers_v6: Option<Vec<String>>,
 
     credential_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    managed_credentials: Vec<ManagedCredentialConfig>,
     source: Option<ConfigSourceConfig>,
 }
 
@@ -555,6 +513,61 @@ impl TomlConfig {
         }
     }
 
+    #[cfg(feature = "config-write")]
+    fn config_for_dump(&self) -> Config {
+        let mut config = self.config.lock().unwrap().clone();
+        Self::normalize_config_source(&mut config);
+        config
+    }
+
+    #[cfg(feature = "config-write")]
+    fn redact_secrets(config: &mut Config) {
+        const REDACTED: &str = "<redacted>";
+
+        if let Some(secret) = config
+            .network_identity
+            .as_mut()
+            .and_then(|identity| identity.network_secret.as_mut())
+            && !secret.is_empty()
+        {
+            *secret = REDACTED.to_owned();
+        }
+        if let Some(private_key) = config
+            .secure_mode
+            .as_mut()
+            .and_then(|secure_mode| secure_mode.local_private_key.as_mut())
+            && !private_key.is_empty()
+        {
+            *private_key = REDACTED.to_owned();
+        }
+        if let Some(private_key) = config
+            .vpn_portal_config
+            .as_mut()
+            .and_then(|portal| portal.wireguard_private_key.as_mut())
+            && !private_key.is_empty()
+        {
+            *private_key = REDACTED.to_owned();
+        }
+        if let Some(declarations) = config
+            .acl
+            .as_mut()
+            .and_then(|acl| acl.acl_v1.as_mut())
+            .and_then(|acl| acl.group.as_mut())
+            .map(|group| &mut group.declares)
+        {
+            for declaration in declarations {
+                if !declaration.group_secret.is_empty() {
+                    declaration.group_secret = REDACTED.to_owned();
+                }
+            }
+        }
+        for credential in &mut config.managed_credentials {
+            if !credential.credential_secret.is_empty() {
+                credential.credential_secret = REDACTED.to_owned();
+            }
+        }
+    }
+
     pub fn new_from_str(config_str: &str) -> Result<Self, anyhow::Error> {
         Self::new_from_str_with_source("inline config", config_str)
     }
@@ -577,10 +590,12 @@ impl TomlConfig {
     }
 
     fn new_from_config(mut config: Config) -> Result<Self, anyhow::Error> {
-        config.flags_struct = Some(
-            Self::gen_flags(config.flags.clone().unwrap_or_default())
-                .context("failed to parse flags")?,
-        );
+        config.secure_mode = config
+            .secure_mode
+            .take()
+            .map(normalize_secure_mode_config)
+            .transpose()
+            .context("failed to normalize [secure_mode] config")?;
         let has_network_identity = config.network_identity.is_some();
 
         let config = TomlConfig {
@@ -611,20 +626,9 @@ impl TomlConfig {
 
         Ok(config)
     }
-
-    fn gen_flags(
-        flags_hashmap: serde_json::Map<String, serde_json::Value>,
-    ) -> serde_json::Result<Flags> {
-        let mut merged_hashmap = match serde_json::to_value(gen_default_flags()) {
-            Ok(serde_json::Value::Object(map)) => map,
-            _ => serde_json::Map::new(),
-        };
-        merged_hashmap.extend(flags_hashmap);
-        serde_json::from_value(serde_json::Value::Object(merged_hashmap))
-    }
 }
 
-#[cfg(feature = "management")]
+#[cfg(feature = "web-client")]
 mod snapshot;
 
 impl ConfigLoader for TomlConfig {
@@ -741,12 +745,20 @@ impl ConfigLoader for TomlConfig {
             prefix.map(|prefix| prefix.to_string());
     }
 
-    fn get_dhcp(&self) -> bool {
+    fn get_dhcp_config(&self) -> DhcpConfig {
         self.config.lock().unwrap().dhcp.unwrap_or_default()
     }
 
-    fn set_dhcp(&self, dhcp: bool) {
+    fn set_dhcp_config(&self, dhcp: DhcpConfig) {
         self.config.lock().unwrap().dhcp = Some(dhcp);
+    }
+
+    fn get_dhcpv6_config(&self) -> DhcpConfig<cidr::Ipv6Cidr> {
+        self.config.lock().unwrap().dhcpv6.unwrap_or_default()
+    }
+
+    fn set_dhcpv6_config(&self, dhcp: DhcpConfig<cidr::Ipv6Cidr>) {
+        self.config.lock().unwrap().dhcpv6 = Some(dhcp);
     }
 
     fn add_proxy_cidr(
@@ -885,16 +897,27 @@ impl ConfigLoader for TomlConfig {
     }
 
     fn get_flags(&self) -> Flags {
-        self.config
-            .lock()
-            .unwrap()
-            .flags_struct
-            .clone()
-            .unwrap_or_default()
+        Flags::resolve(self.get_flags_patch())
     }
 
     fn set_flags(&self, flags: Flags) {
-        self.config.lock().unwrap().flags_struct = Some(flags);
+        self.config.lock().unwrap().flags = flags.downgrade();
+    }
+
+    fn get_flags_patch(&self) -> FlagsPatch {
+        self.config.lock().unwrap().flags.clone()
+    }
+
+    fn patch_flags(&self, flags: FlagsPatch) {
+        // Protobuf merge: an update overwrites exactly the fields it carries,
+        // and presence is the encoding, so a flag explicitly set to its default
+        // value is applied like any other. Optionize's merge cannot express that
+        // here, because the one flattened nullable field would have to assign
+        // unconditionally.
+        let mut config = self.config.lock().unwrap();
+        let update = prost::Message::encode_to_vec(&flags);
+        prost::Message::merge(&mut config.flags, update.as_slice())
+            .expect("decoding the bytes just encoded cannot fail");
     }
 
     fn get_exit_nodes(&self) -> Vec<IpAddr> {
@@ -981,6 +1004,14 @@ impl ConfigLoader for TomlConfig {
         self.config.lock().unwrap().stun_servers = servers;
     }
 
+    fn get_tcp_stun_servers(&self) -> Option<Vec<String>> {
+        self.config.lock().unwrap().tcp_stun_servers.clone()
+    }
+
+    fn set_tcp_stun_servers(&self, servers: Option<Vec<String>>) {
+        self.config.lock().unwrap().tcp_stun_servers = servers;
+    }
+
     fn get_stun_servers_v6(&self) -> Option<Vec<String>> {
         self.config.lock().unwrap().stun_servers_v6.clone()
     }
@@ -1005,6 +1036,14 @@ impl ConfigLoader for TomlConfig {
         self.config.lock().unwrap().credential_file = path;
     }
 
+    fn get_managed_credentials(&self) -> Vec<ManagedCredentialConfig> {
+        self.config.lock().unwrap().managed_credentials.clone()
+    }
+
+    fn set_managed_credentials(&self, credentials: Vec<ManagedCredentialConfig>) {
+        self.config.lock().unwrap().managed_credentials = credentials;
+    }
+
     fn get_network_config_source(&self) -> ConfigSource {
         self.config
             .lock()
@@ -1025,15 +1064,19 @@ impl ConfigLoader for TomlConfig {
     fn dump(&self) -> String {
         #[cfg(feature = "config-write")]
         {
-            let mut config = self.config.lock().unwrap().clone();
-            Self::normalize_config_source(&mut config);
-            config.flags = Some(flags_diff_from_default(&self.get_flags()));
-            if config.stun_servers == Some(default_udp_stun_servers()) {
-                config.stun_servers = None;
-            }
-            if config.stun_servers_v6 == Some(default_udp_v6_stun_servers()) {
-                config.stun_servers_v6 = None;
-            }
+            toml::to_string_pretty(&self.config_for_dump()).unwrap()
+        }
+        #[cfg(not(feature = "config-write"))]
+        {
+            panic!("this build does not include TOML configuration serialization")
+        }
+    }
+
+    fn dump_redacted(&self) -> String {
+        #[cfg(feature = "config-write")]
+        {
+            let mut config = self.config_for_dump();
+            Self::redact_secrets(&mut config);
             toml::to_string_pretty(&config).unwrap()
         }
         #[cfg(not(feature = "config-write"))]
@@ -1051,19 +1094,113 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_error_preserves_source_and_location() {
-        let error =
-            TomlConfig::new_from_str_with_source("fixture.toml", "dhcp = \"yes\"").unwrap_err();
-        let display = error.to_string();
+    fn dhcp_accepts_booleans_and_ipv4_subnets() {
+        assert!(!TomlConfig::default().get_dhcp());
+        for (value, expected) in [
+            ("false", DhcpConfig::Enabled(false)),
+            ("true", DhcpConfig::Enabled(true)),
+            (
+                "'192.168.100.0/24'",
+                DhcpConfig::Cidr("192.168.100.0/24".parse().unwrap()),
+            ),
+            (
+                "'192.168.100.0/30'",
+                DhcpConfig::Cidr("192.168.100.0/30".parse().unwrap()),
+            ),
+            (
+                "'0.0.0.0/0'",
+                DhcpConfig::Cidr("0.0.0.0/0".parse().unwrap()),
+            ),
+        ] {
+            let config = TomlConfig::new_from_str(&format!("dhcp = {value}")).unwrap();
+            assert_eq!(config.get_dhcp_config(), expected);
+            assert_eq!(config.get_dhcp(), expected.enabled());
+            #[cfg(feature = "config-write")]
+            assert_eq!(
+                TomlConfig::new_from_str(&config.dump())
+                    .unwrap()
+                    .get_dhcp_config(),
+                expected
+            );
+            config.set_dhcp(false);
+            assert_eq!(config.get_dhcp_config(), DhcpConfig::Enabled(false));
+        }
+    }
 
-        assert!(display.contains("fixture.toml"));
-        assert!(display.contains("dhcp = \"yes\""));
-        assert!(display.contains("invalid type: string"));
-        assert!(
-            error
-                .chain()
-                .any(|cause| cause.downcast_ref::<toml::de::Error>().is_some())
-        );
+    #[test]
+    fn dhcpv6_config_round_trip_and_validation() {
+        assert!(!TomlConfig::default().get_dhcpv6());
+        for value in [
+            "true",
+            "false",
+            "'fd12:3456::/64'",
+            "'fd12::/126'",
+            "'2001:db8::/48'",
+        ] {
+            let config =
+                TomlConfig::new_from_str(&format!("dhcp = true\ndhcpv6 = {value}")).unwrap();
+            let exported = config.dump();
+            let restored = TomlConfig::new_from_str(&exported).unwrap();
+            assert_eq!(restored.get_dhcpv6_config(), config.get_dhcpv6_config());
+            assert!(restored.get_dhcp());
+            assert!(exported.contains("dhcp = true"));
+        }
+        for value in [
+            "yes",
+            "10.0.0.0/24",
+            "fd12::1/64",
+            "fd12::/127",
+            "fd12::/128",
+            "::/0",
+            "::/64",
+            "fe80::/64",
+            "ff00::/8",
+        ] {
+            assert!(
+                TomlConfig::new_from_str(&format!("dhcpv6 = '{value}'")).is_err(),
+                "accepted {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn dhcp_rejects_invalid_or_unusable_subnets() {
+        for value in [
+            "'yes'",
+            "'true'",
+            "'::/64'",
+            "'192.168.100.0/31'",
+            "'192.168.100.1/32'",
+            "'192.168.100.1/24'",
+            "'192.168.100.0/33'",
+            "'192.168.100.1'",
+            "123",
+            "{}",
+            "[]",
+        ] {
+            assert!(
+                TomlConfig::new_from_str(&format!("dhcp = {value}")).is_err(),
+                "accepted {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_error_preserves_source_and_location() {
+        for field in ["dhcp", "dhcpv6"] {
+            let input = format!("{field} = \"yes\"");
+            let error = TomlConfig::new_from_str_with_source("fixture.toml", &input).unwrap_err();
+            let display = error.to_string();
+
+            assert!(display.contains("fixture.toml"));
+            assert!(display.contains(&input));
+            assert!(display.contains("invalid DHCP CIDR"));
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.downcast_ref::<toml::de::Error>().is_some())
+            );
+        }
     }
 
     #[cfg(feature = "config-write")]
@@ -1099,6 +1236,102 @@ socket_mark = 0
         assert_eq!(restored.get_listener_uris(), config.get_listener_uris());
         assert_eq!(restored.get_flags().mtu, 1420);
         assert_eq!(restored.get_flags().socket_mark, Some(0));
+    }
+
+    #[test]
+    fn legacy_vpn_portal_client_cidr_is_rejected_explicitly() {
+        let error = TomlConfig::new_from_str(
+            r#"
+[vpn_portal_config]
+client_cidr = "10.14.14.0/24"
+wireguard_listen = "0.0.0.0:51820"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("client_cidr"), "{error}");
+    }
+
+    #[cfg(feature = "config-write")]
+    #[test]
+    fn vpn_portal_round_trip_and_redacted_dump_preserve_dump_semantics() {
+        let config = TomlConfig::new_from_str(
+            r#"
+[network_identity]
+network_name = "network-a"
+network_secret = "network-secret"
+
+[secure_mode]
+enabled = true
+local_private_key = "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE="
+
+[vpn_portal_config]
+wireguard_listen = "0.0.0.0:51820"
+wireguard_private_key = "wireguard-private-key"
+
+[[vpn_portal_config.clients]]
+name = "alice"
+virtual_ip = "10.144.144.10/24"
+groups = ["staff"]
+
+[acl.acl_v1.group]
+
+[[acl.acl_v1.group.declares]]
+group_name = "staff"
+group_secret = "group-secret"
+"#,
+        )
+        .unwrap();
+
+        let dumped = config.dump();
+        assert!(dumped.contains("network-secret"));
+        assert!(dumped.contains("YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE="));
+        assert!(dumped.contains("wireguard-private-key"));
+        assert!(dumped.contains("group-secret"));
+        assert_eq!(
+            TomlConfig::new_from_str(&dumped)
+                .unwrap()
+                .get_vpn_portal_config(),
+            config.get_vpn_portal_config()
+        );
+
+        let redacted = config.dump_redacted();
+        assert!(!redacted.contains("network-secret"));
+        assert!(!redacted.contains("YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE="));
+        assert!(!redacted.contains("wireguard-private-key"));
+        assert!(!redacted.contains("group-secret"));
+        assert_eq!(redacted.matches("<redacted>").count(), 4);
+    }
+
+    #[cfg(feature = "config-write")]
+    #[test]
+    fn managed_credentials_round_trip_and_redact_secret() {
+        let config = TomlConfig::new_from_str(
+            r#"
+[[managed_credentials]]
+credential_id = "managed-a"
+credential_secret = "private-key-material"
+groups = ["ops"]
+allow_relay = true
+allowed_proxy_cidrs = ["10.0.0.0/24"]
+expiry_unix = 2000000000
+"#,
+        )
+        .unwrap();
+
+        let dumped = config.dump();
+        let restored = TomlConfig::new_from_str(&dumped).unwrap();
+        assert_eq!(
+            restored.get_managed_credentials(),
+            config.get_managed_credentials()
+        );
+        assert!(dumped.contains("private-key-material"));
+
+        let redacted = config.dump_redacted();
+        assert!(!redacted.contains("private-key-material"));
+        assert!(redacted.contains("<redacted>"));
+        assert!(!TomlConfig::default().dump().contains("managed_credentials"));
     }
 
     #[test]
@@ -1156,35 +1389,8 @@ source = "web"
 #[cfg(test)]
 mod compatibility_tests {
     use super::*;
-
-    #[cfg(feature = "config-write")]
-    #[test]
-    fn flags_diff_covers_every_protobuf_field() {
-        use prost::Message as _;
-
-        let descriptor_set =
-            prost_types::FileDescriptorSet::decode(crate::proto::DESCRIPTOR_POOL_BYTES).unwrap();
-        let proto_fields = descriptor_set
-            .file
-            .iter()
-            .find(|file| file.package.as_deref() == Some("common"))
-            .and_then(|file| {
-                file.message_type
-                    .iter()
-                    .find(|message| message.name.as_deref() == Some("FlagsInConfig"))
-            })
-            .unwrap()
-            .field
-            .iter()
-            .map(|field| field.name.as_deref().unwrap())
-            .collect::<std::collections::BTreeSet<_>>();
-        let diff_fields = FLAGS_DIFF_FIELDS
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-
-        assert_eq!(diff_fields, proto_fields);
-    }
+    use crate::proto::common::CompressionAlgoPb;
+    use base64::{Engine as _, prelude::BASE64_STANDARD};
 
     #[test]
     fn socket_mark_config_file_roundtrip_none_some_and_zero() {
@@ -1235,13 +1441,91 @@ socket_mark = 66
             ..cfg.get_flags()
         });
         assert_eq!(cfg.get_flags().socket_mark, None);
+        #[cfg(feature = "config-write")]
+        assert_eq!(
+            TomlConfigLoader::new_from_str(&cfg.dump())
+                .unwrap()
+                .get_flags()
+                .socket_mark,
+            None
+        );
+    }
+
+    #[cfg(feature = "config-write")]
+    #[test]
+    fn flags_presence_survives_parse_patch_and_dump() {
+        for (input, expected) in [
+            ("", None),
+            ("enable_encryption = true", Some(true)),
+            ("enable_encryption = false", Some(false)),
+        ] {
+            let config = TomlConfig::new_from_str(&format!("[flags]\n{input}")).unwrap();
+            assert_eq!(config.get_flags_patch().enable_encryption, expected);
+            config.patch_flags(FlagsPatch {
+                latency_first: Some(false),
+                ..Default::default()
+            });
+            let restored = TomlConfig::new_from_str(&config.dump()).unwrap();
+            assert_eq!(restored.get_flags_patch().enable_encryption, expected);
+            assert_eq!(restored.get_flags_patch().latency_first, Some(false));
+            assert_eq!(restored.get_flags_patch().mtu, None);
+            assert_eq!(
+                restored.get_flags().enable_encryption,
+                expected.unwrap_or(true)
+            );
+        }
+    }
+
+    #[test]
+    fn flags_accept_protobuf_aliases_and_numbers_without_default_collisions() {
+        let config = TomlConfig::new_from_str(
+            r#"[flags]
+enableEncryption = false
+mtu = "1420"
+foreignRelayBpsLimit = "18446744073709551615"
+dataCompressAlgo = "Zstd"
+socketMark = "0"
+"#,
+        )
+        .unwrap();
+        let flags = config.get_flags();
+        assert!(!flags.enable_encryption);
+        assert_eq!(flags.mtu, 1420);
+        assert_eq!(flags.foreign_relay_bps_limit, u64::MAX);
+        assert_eq!(flags.data_compress_algo, CompressionAlgoPb::Zstd as i32);
+        assert_eq!(flags.socket_mark, Some(0));
+        for fields in [
+            "enableEncryption = true\nenable_encryption = false",
+            "mtu = -1",
+            "mtu = 4294967296",
+            "unknown_flag = true",
+            "data_compress_algo = 99",
+        ] {
+            assert!(
+                TomlConfig::new_from_str(&format!("[flags]\n{fields}")).is_err(),
+                "{fields}"
+            );
+        }
+    }
+
+    #[cfg(feature = "config-write")]
+    #[test]
+    fn dump_omits_all_default_flags() {
+        let config = TomlConfigLoader::default();
+        let dumped = config.dump();
+        let document: toml::Table = toml::from_str(&dumped).unwrap();
+        assert!(document["flags"].as_table().unwrap().is_empty());
+        assert_eq!(
+            TomlConfigLoader::new_from_str(&dumped).unwrap().get_flags(),
+            Flags::resolve(FlagsPatch::default())
+        );
     }
 
     #[cfg(feature = "config-write")]
     #[test]
     fn dump_preserves_flags_that_differ_from_easytier_defaults() {
         let cfg = TomlConfigLoader::default();
-        let mut flags = gen_default_flags();
+        let mut flags = Flags::resolve(FlagsPatch::default());
         flags.dev_name = "et_test".to_string();
         flags.enable_quic_proxy = true;
         flags.disable_tcp_hole_punching = true;
@@ -1250,6 +1534,7 @@ socket_mark = 66
         flags.bind_device = false;
         flags.enable_ipv6 = false;
         flags.relay_network_whitelist = "".to_string();
+        flags.prefer_peer_relay = true;
         flags.mtu = 0;
         flags.foreign_relay_bps_limit = u64::MAX - 1;
         flags.instance_recv_bps_limit = u64::MAX - 2;
@@ -1283,6 +1568,7 @@ socket_mark = 66
         assert!(!reloaded_flags.bind_device);
         assert!(!reloaded_flags.enable_ipv6);
         assert_eq!(reloaded_flags.relay_network_whitelist, "");
+        assert!(reloaded_flags.prefer_peer_relay);
         assert_eq!(reloaded_flags.mtu, 0);
         assert_eq!(reloaded_flags.foreign_relay_bps_limit, u64::MAX - 1);
         assert_eq!(reloaded_flags.instance_recv_bps_limit, u64::MAX - 2);
@@ -1298,6 +1584,7 @@ socket_mark = 66
         let config = TomlConfigLoader::default();
         let stun_servers = config.get_stun_servers();
         assert!(stun_servers.is_none());
+        assert!(config.get_tcp_stun_servers().is_none());
 
         // Test setting custom stun servers
         let custom_servers = vec!["txt:stun.easytier.cn".to_string()];
@@ -1305,6 +1592,12 @@ socket_mark = 66
 
         let retrieved_servers = config.get_stun_servers();
         assert_eq!(retrieved_servers.unwrap(), custom_servers);
+
+        let custom_tcp_servers = vec!["tcp-stun.example.com:3478".to_string()];
+        config.set_tcp_stun_servers(Some(custom_tcp_servers.clone()));
+
+        let retrieved_tcp_servers = config.get_tcp_stun_servers();
+        assert_eq!(retrieved_tcp_servers.unwrap(), custom_tcp_servers);
     }
 
     #[test]
@@ -1315,15 +1608,33 @@ stun_servers = [
     "stun.l.google.com:19302",
     "stun1.l.google.com:19302",
     "txt:stun.easytier.cn"
+]
+tcp_stun_servers = [
+    "tcp-stun.example.com:3478"
 ]"#;
 
         let config = TomlConfigLoader::new_from_str(config_str).unwrap();
         let stun_servers = config.get_stun_servers().unwrap();
+        let tcp_stun_servers = config.get_tcp_stun_servers().unwrap();
 
         assert_eq!(stun_servers.len(), 3);
         assert_eq!(stun_servers[0], "stun.l.google.com:19302");
         assert_eq!(stun_servers[1], "stun1.l.google.com:19302");
         assert_eq!(stun_servers[2], "txt:stun.easytier.cn");
+        assert_eq!(tcp_stun_servers, ["tcp-stun.example.com:3478"]);
+    }
+
+    #[test]
+    fn test_empty_tcp_stun_servers_toml_parsing() {
+        let config = TomlConfigLoader::new_from_str(
+            r#"
+instance_name = "test"
+tcp_stun_servers = []
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.get_tcp_stun_servers(), Some(Vec::new()));
     }
 
     #[cfg(feature = "config-write")]
@@ -1380,6 +1691,112 @@ enabled = true
         assert_eq!(identity.network_name, "default");
         assert_eq!(identity.network_secret.as_deref(), Some(""));
         assert!(identity.network_secret_digest.is_some());
+    }
+
+    #[test]
+    fn test_toml_secure_mode_generates_keypair_when_keys_missing() {
+        let config = TomlConfigLoader::new_from_str(
+            r#"
+[secure_mode]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        let secure_mode = config.get_secure_mode().unwrap();
+        let private_key = secure_mode.private_key().unwrap();
+        let public_key = secure_mode.public_key().unwrap();
+        assert_eq!(
+            x25519_dalek::PublicKey::from(&private_key).as_bytes(),
+            public_key.as_bytes()
+        );
+    }
+
+    #[test]
+    fn test_toml_secure_mode_derives_public_key_from_private_key() {
+        let private = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let config = TomlConfigLoader::new_from_str(&format!(
+            r#"
+[secure_mode]
+enabled = true
+local_private_key = "{}"
+"#,
+            BASE64_STANDARD.encode(private.as_bytes())
+        ))
+        .unwrap();
+
+        let secure_mode = config.get_secure_mode().unwrap();
+        let private_key = secure_mode.private_key().unwrap();
+        assert_eq!(private_key.as_bytes(), private.as_bytes());
+        assert_eq!(
+            secure_mode.public_key().unwrap().as_bytes(),
+            x25519_dalek::PublicKey::from(&private).as_bytes()
+        );
+    }
+
+    #[test]
+    fn test_toml_secure_mode_rejects_mismatched_keypair() {
+        let private = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let other_public = x25519_dalek::PublicKey::from(
+            &x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng),
+        );
+        let error = TomlConfigLoader::new_from_str(&format!(
+            r#"
+[secure_mode]
+enabled = true
+local_private_key = "{}"
+local_public_key = "{}"
+"#,
+            BASE64_STANDARD.encode(private.as_bytes()),
+            BASE64_STANDARD.encode(other_public.as_bytes())
+        ))
+        .unwrap_err();
+        let error = format!("{error:#}");
+
+        assert!(
+            error.contains("failed to normalize [secure_mode] config"),
+            "{error}"
+        );
+        assert!(
+            error.contains("does not match generated public key"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_toml_secure_mode_disabled_keeps_keys_unset() {
+        let config = TomlConfigLoader::new_from_str(
+            r#"
+[secure_mode]
+enabled = false
+"#,
+        )
+        .unwrap();
+
+        let secure_mode = config.get_secure_mode().unwrap();
+        assert!(!secure_mode.enabled);
+        assert_eq!(secure_mode.local_private_key, None);
+        assert_eq!(secure_mode.local_public_key, None);
+    }
+
+    #[cfg(feature = "config-write")]
+    #[test]
+    fn test_toml_secure_mode_keypair_survives_roundtrip() {
+        let config = TomlConfigLoader::new_from_str(
+            r#"
+[secure_mode]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        let dumped = config.dump();
+        let restored = TomlConfigLoader::new_from_str(&dumped).unwrap();
+
+        assert_eq!(
+            config.get_secure_mode().unwrap(),
+            restored.get_secure_mode().unwrap()
+        );
     }
 
     #[test]
@@ -1589,13 +2006,16 @@ mod diagnostic_compatibility_tests {
 
     #[test]
     fn non_ascii_before_typed_error_keeps_byte_location() {
-        let error = TomlConfig::new_from_str("hostname = \"节点\"\ndhcp = \"yes\"")
-            .unwrap_err()
-            .to_string();
+        for field in ["dhcp", "dhcpv6"] {
+            let invalid_field = format!("{field} = \"yes\"");
+            let error = TomlConfig::new_from_str(&format!("hostname = \"节点\"\n{invalid_field}"))
+                .unwrap_err()
+                .to_string();
 
-        assert!(error.contains("dhcp = \"yes\""));
-        assert!(error.contains('^'));
-        assert!(error.contains("invalid type: string"));
+            assert!(error.contains(&invalid_field));
+            assert!(error.contains('^'));
+            assert!(error.contains("invalid DHCP CIDR"));
+        }
     }
 
     #[cfg(feature = "rich-config-errors")]
@@ -1612,7 +2032,7 @@ mod diagnostic_compatibility_tests {
     }
 
     #[test]
-    fn flags_conversion_error_keeps_source_and_cause_chain() {
+    fn flags_parse_error_keeps_source_span_and_cause_chain() {
         let error = TomlConfig::new_from_str_with_source(
             "flags-fixture.toml",
             "[flags]\nsocket_mark = \"bad\"",
@@ -1621,12 +2041,13 @@ mod diagnostic_compatibility_tests {
         let display = error.to_string();
 
         assert!(display.contains("flags-fixture.toml"));
-        assert!(display.contains("failed to load config"));
-        assert!(display.contains("failed to parse flags"));
+        assert!(display.contains("failed to parse config TOML"));
+        assert!(display.contains("socket_mark = \"bad\""));
+        assert!(display.contains('^'));
         assert!(
             error
                 .chain()
-                .any(|cause| cause.to_string().contains("failed to parse flags"))
+                .any(|cause| cause.downcast_ref::<toml::de::Error>().is_some())
         );
     }
 }

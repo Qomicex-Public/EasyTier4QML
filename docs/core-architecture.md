@@ -179,16 +179,46 @@ wire codecs. It does not own socket I/O or connection policy.
 - UDP session multiplexing, classification, and lifecycle;
 - in-process Ring sockets.
 
+UDP sessions expose a scoped hole-punch source observer keyed by transaction
+ID. Listeners carry a registration handle for their existing receive loop, which
+reports the first matching source; dropping the observer removes the registration.
+Cone clients optionally prepare that transaction in the listener-selection RPC;
+the response echoes its ID only after registration. The registration retains
+early UDP sources until the cone-sending RPC claims it. Unclaimed registrations
+expire after 30 seconds through the existing listener cleanup loop, covering
+local socket and STUN preparation without a separate receive or sending task.
+Clients omitting the optional transaction retain registration at the sending RPC;
+older servers omit the echoed ID and do not confirm early registration.
+Connectivity owns preparation expiry, the active RPC lifetime, candidate selection
+and bounded sending to the signaled and observed addresses.
+Cone clients start the existing UDP handshake without requiring a reverse
+hole-punch packet, and the session layer remains the sole receiver.
+
 `host/` is the single home of Host capability seams:
 
 - DNS and DNS record resolution;
 - connector environment observations;
 - packet ingress and egress;
-- Host socket operation bridges and handle-based TCP/UDP/listener adapters.
+- Host socket operation bridges and handle-based TCP/UDP/listener adapters;
+- host-owned, message-preserving tunnel endpoints.
 
 Core owns scheduling, backpressure, cancellation, UDP session state, and
 protocol state even when each actual operation crosses a Host Adapter. A Host
 Adapter owns the real resource and performs the OS operation.
+
+For host-owned tunnels, ownership crosses the guest ABI only after a bounded
+Host listener queue accepts the tunnel. The queue is registered through
+`CoreHostAdapters` and consumed by the normal `CoreListenerRuntime`, so the
+tunnel still reaches `PeerAcceptedTunnelHandler` and cannot bypass peer
+handshake, admission, events, or routing policy. Each Host receive produces
+one complete `DummyTunnel` payload; no stream framing is added. The Host owns
+transport-specific message validation and maps a clean close to tunnel EOF.
+
+Hosts without outbound sockets select `CoreConnectivityMode::InboundOnly` for
+one instance. That startup plan retains listeners and the peer/router while
+omitting STUN, outbound connectors, and hole punching. Cargo features only
+compile Host Adapters; they do not change `CoreInstance` fields, lifecycle, or
+management semantics.
 
 The native `NativeHostRuntime` is process-wide and does not retain an instance
 `GlobalCtx`, namespace guard, socket mark, or connectivity state. Differences
@@ -217,7 +247,10 @@ are not independent owners of EasyTier peer state.
 
 Each protocol registration must provide a coherent client/server Adapter.
 Unavailable configured transports must be rejected during validation or
-protocol selection, rather than silently falling back to another transport.
+protocol selection in the standard runtime, rather than silently falling back
+to another transport. A compact compatibility Host may instead retain the
+desired value for management readback and omit it from normalized runtime
+state; it must not advertise or partially activate the unavailable transport.
 
 ### Connectivity
 
@@ -277,14 +310,20 @@ Generated service descriptors and message types remain in `easytier-proto`.
 - VPN portal client/session policy;
 - UDP broadcast classification and rewrite policy.
 
+Each VPN portal client is normalized to one attached-peer IPv4 CIDR. The
+portable gateway owns that client address and prefix; the hosting network
+manager's DHCP or static address is not a source of portal client routing
+facts.
+
 TUN, raw sockets, transparent-destination lookup, concrete protocol engines,
 native DNS servers, namespace operations, and route application stay in native
 Adapters.
 
 Optional gateway capabilities are selected by cohesive Modules. Disabled
 implementations retain stable lifecycle calls and report unsupported
-configuration where a stable interface is required; they do not duplicate
-portable policy.
+configuration in the standard runtime. A compact compatibility Host may
+silently normalize those settings to no-ops while preserving the desired TOML
+model; disabled implementations do not duplicate portable policy.
 
 The instance-scoped `DataPlaneSession` composes the foundation operation broker
 under the same session lock as its resource and quota state. The broker owns
@@ -324,6 +363,19 @@ A core instance:
 `CoreHostAdapters` contains the required Host, DNS, packet sink, and
 `CoreProcessRuntime`, plus optional protocol and platform capabilities. The
 bundle carries capabilities, not preconstructed portable managers.
+
+By default, the standard native factory owns one continuously driven Tokio
+executor per instance. `multi_thread` selects a multi-thread or current-thread
+runtime; `multi_thread_count` sets the worker count with the historical minimum
+of two. The `easytier-core --shared-runtime` option instead shares one
+multi-thread executor across the factory and all its instances. Its worker count
+defaults to the available CPU count and can be set with the process-level
+`--multi-thread-count` option, with a minimum of one; per-instance runtime flags
+are ignored in this mode. Construction, start/stop, and FFI data-plane tasks use
+the selected executor, independent of the process management runtime. Dropping
+the last factory or instance Host owner shuts down the executor without blocking
+a worker on its own termination. Compact and WASI Hosts retain their externally
+supplied execution model.
 
 Each Module owns partial-start cleanup for its internal resources.
 `CoreInstance` has one outer cancellation and recovery path for the complete
@@ -366,12 +418,87 @@ Process-global capability objects may contain stateless or shared platform
 mechanisms. They must not contain instance-specific peer, route,
 configuration, or connectivity state.
 
+### Native shared TUN ownership
+
+The native composition owns `SharedVirtualNicRegistry`. Named desktop TUNs
+are shared within a network namespace; mobile instances attach to one supplied
+TUN descriptor. Members own address, route, and MTU claims, not the physical
+device. Bootstrap route cleanup runs only when that device is created. Mobile
+IPv6 claims are initialized before forwarding and follow public IPv6 updates.
+Mobile VPN configuration is projected from admitted members' native claims.
+Admission keeps unchanged attached members ahead of conflicting newcomers or
+reconfigured members. Rejected members are reported individually, while the
+remaining members stay attached. Each member's initial claims are applied as
+one batch before it can open or replace the shared descriptor.
+Mobile claims update dispatcher tables without configuring the OS interface;
+the platform VPN owns its addresses, routes, and MTU.
+If applying native claims fails, the shared NIC is invalidated and its
+dispatcher is stopped so every member can recreate the device. Restoring only
+the recorded claims would leave partially applied OS configuration in use.
+TUN replacement and I/O failures also invalidate the shared NIC. TUN writes
+have bounded waits so a stalled device cannot indefinitely block claim updates
+or member cleanup.
+
+Desktop and mobile shared TUNs use the same lazily initialized native Tokio
+runtime, independent of every member's executor. It creates the device's async
+I/O registration, drives dispatchers, and completes member claim cleanup even
+after the member executor stops or the registration is dropped outside Tokio.
+The runtime has two workers on desktop to allow independent TUN dispatchers
+to run concurrently, and retains one worker on mobile. It owns no registry or
+member claims; those remain with each shared NIC. Cleanup remains asynchronous,
+and the last member's cleanup stops the dispatcher and releases the desktop
+device. A process-lifetime runtime does not extend the device's lifetime.
+Unnamed desktop TUNs and instance-local work retain their existing executors.
+
+Each member connects through one bounded Ring Tunnel. The shared dispatcher
+polls member streams in rotation and writes directly to their sinks, with no
+per-member forwarding tasks or intermediate packet queues. Desktop and mobile
+use one dispatch loop; mobile descriptor replacement is a control message.
+The loop consumes Tokio's cooperative budget even when packets are dropped.
+
+Only the member running the Magic DNS resolver claims its shared fake-IP
+route. The claim is removed before resolver shutdown and acquired by the next
+serving member after takeover. Client-only runners do not claim that route.
+
+The dispatcher preserves desktop kernel-forwarded subnet sources. It corrects
+wrong-member local sources and, on mobile, synthetic sources. Native local
+flows and translated flows reserve member-scoped transport tuples so address
+translation cannot merge sockets using the same port and remote endpoint.
+Collisions remap the source port or ICMP Echo identifier; replies restore the
+original tuple. Unrelated route updates and member removals retain mappings.
+All Echo sequence numbers for one identifier share a reservation; translation
+preserves the sequence field in each request and reply.
+Removing an involved address or member releases its mappings. A full member
+queue drops that packet without blocking other members or control messages.
+
+With one attached member, packets go directly to that member without destination
+matching or new source translations. Native flow reservations remain active so
+later members cannot reuse their tuples. Existing translations continue in both
+directions after other members leave. Unmodified IPv4 fragments and IPv6
+extension headers pass through the single-member path unchanged.
+
+Reservations are bounded at 4096 flows. Activity in either direction refreshes
+them; table pressure reclaims reservations idle for at least 180 seconds. If
+all slots remain active, new tracked flows are dropped rather than evicting a
+live mapping. Desktop external-source forwarding bypasses this table. As with
+other idle-expiring NAT state, very late replies after tuple reuse cannot be
+distinguished from replies to the new flow.
+
+Translation supports unfragmented IPv4 and ordinary IPv6 TCP, UDP, and ICMP
+Echo traffic. IPv4 fragment and IPv6 extension-header translation remain
+unsupported. ICMP errors quoting a translated flow are not reverse-translated;
+in particular, a smaller downstream MTU can prevent PMTU discovery for such
+flows. This limitation does not affect unmodified flows and is intentionally
+retained rather than extending the dispatcher into a full ICMP/fragment NAT.
+
 ## Runtime configuration authority
 
-`TomlConfig` is an owned construction input. After startup, it is not a second
-mutable source of truth.
+`TomlConfig` is the authoritative desired configuration used for management
+readback and patch transactions. Compact Hosts keep unsupported accepted values
+there so controllers observe the configuration they submitted.
 
-The normalized core runtime store is authoritative for:
+The separately typed, normalized core runtime store is authoritative for live
+behavior:
 
 - peer feature flags and routing policy;
 - listeners and initial peers;
@@ -379,6 +506,28 @@ The normalized core runtime store is authoritative for:
 - manual and VPN portal CIDRs;
 - gateway and connectivity settings;
 - runtime configuration patches.
+
+Manual routing retains three distinct states: absent routes select automatic
+routing, a present empty list installs no remote subnet routes, and a present
+nonempty list selects explicit routes. `NetworkConfig.enable_manual_routes`
+preserves this distinction on readback. `InstanceConfigPatch` applies its
+optional `enable_manual_routes` together with route edits in one route
+sub-patch: true retains an empty manual list and false restores automatic
+routing. Omitting the mode preserves released RoutePatch behavior, including
+returning to automatic routing when the edited list becomes empty. This does
+not change the ordered partial-commit contract of a multi-field patch.
+
+`HeartbeatRequest.support_manual_routes_patch` advertises this complete route
+contract, including typed empty-manual readback, on the WebClient Session.
+The Web controller uses the current authenticated heartbeat to choose route
+patches; observed instance configuration caches contain no capability state.
+Released clients omit the flag and still receive
+full configuration replacements for route changes. For their ambiguous empty
+readback, Web reads the existing `GetConfig.toml_config`, or, when absent, the
+instance-scoped `ShowNodeInfo` TOML used by 2.6.4. It reads only the instance ID
+and route field, requires a matching instance, and confirms the actual mode
+before recording application. Supporting clients use typed readback directly;
+compact clients with raw GetConfig need no Peer management RPC.
 
 Host persistence is an effect following a successful core transaction. A Host
 Adapter must not call back into an instance to obtain a hidden configuration
@@ -407,6 +556,13 @@ tracing backend records events and deliberately ignores span trees. The
 optional `tracing` feature selects the tokio-console subscriber integration;
 only that diagnostic profile pulls the main crate's `tracing-subscriber` and
 `console-subscriber` dependencies.
+
+The native CLI enables the `CORE` and `easytier_core::instance::manager` console
+targets by default. Instance startup failures are reported immediately with the
+instance ID and complete error chain, including the listener URL for bind
+failures. When all instances stop, the CLI's failure summary retains each failed
+instance's ID and saved error. Explicit console levels and `RUST_LOG` directives
+still control which records are emitted.
 
 Contrib applications and platform integrations may have independent logging
 requirements and are not implicitly wired to the native process logger.
@@ -477,8 +633,9 @@ configuration, management, packet-plane, or test-support interfaces.
 14. Unknown protobuf fields in reflected route information survive forwarding
     and credential filtering.
 15. Feature selection is localized at cohesive Module/Adapter boundaries.
-16. Unsupported configured capabilities fail explicitly rather than changing
-    wire protocol or silently falling back.
+16. The standard runtime rejects unsupported configured capabilities. Compact
+    compatibility Hosts may preserve them as runtime no-ops, but never change
+    wire protocol, advertise them, or silently fall back to an unsafe mode.
 
 ## Validation
 
