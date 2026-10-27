@@ -47,3 +47,4 @@ easytier-gui/src-tauri/*.sys
 
 # contrib
 go.sum
+.memory/
