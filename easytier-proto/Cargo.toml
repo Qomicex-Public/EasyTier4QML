@@ -50,7 +50,7 @@ serde_json.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 reqwest = { workspace = true, default-features = true, features = ["blocking"] }
-zip = "8.6.0"
+zip = "9.1.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = [
