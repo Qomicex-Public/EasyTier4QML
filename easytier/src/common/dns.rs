@@ -7,13 +7,11 @@ use async_trait::async_trait;
 use easytier_core::host::dns::{DnsQuery, DnsRecordResolver, DnsResolver, DnsSrvRecord};
 use easytier_core::socket::SocketContext;
 #[cfg(feature = "dns-resolver")]
-use hickory_proto::runtime::{RuntimeProvider, TokioRuntimeProvider, iocompat::AsyncIoTokioAsStd};
+use hickory_net::runtime::{RuntimeProvider, TokioRuntimeProvider, iocompat::AsyncIoTokioAsStd};
 #[cfg(feature = "dns-resolver")]
-use hickory_proto::xfer::Protocol;
+use hickory_proto::rr::RData;
 #[cfg(feature = "dns-resolver")]
 use hickory_resolver::config::{LookupIpStrategy, NameServerConfig, ResolverConfig, ResolverOpts};
-#[cfg(feature = "dns-resolver")]
-use hickory_resolver::name_server::{GenericConnector, TokioConnectionProvider};
 #[cfg(feature = "dns-resolver")]
 use hickory_resolver::system_conf::read_system_conf;
 #[cfg(feature = "dns-resolver")]
@@ -38,16 +36,10 @@ use easytier_core::socket::{NetNamespace, tcp::TcpBindOptions, udp::UdpBindOptio
 
 #[cfg(feature = "dns-resolver")]
 pub fn get_default_resolver_config() -> ResolverConfig {
-    let mut default_resolve_config = ResolverConfig::new();
-    default_resolve_config.add_name_server(NameServerConfig::new(
-        "223.5.5.5:53".parse().unwrap(),
-        Protocol::Udp,
-    ));
-    default_resolve_config.add_name_server(NameServerConfig::new(
-        "180.184.1.1:53".parse().unwrap(),
-        Protocol::Udp,
-    ));
-    default_resolve_config
+    ResolverConfig::from_name_servers(vec![
+        NameServerConfig::udp("223.5.5.5".parse().unwrap()),
+        NameServerConfig::udp("180.184.1.1".parse().unwrap()),
+    ])
 }
 
 #[cfg(feature = "dns-resolver")]
@@ -66,11 +58,11 @@ fn resolver_config() -> (ResolverConfig, ResolverOpts) {
 }
 
 #[cfg(feature = "dns-resolver")]
-static RESOLVER: Lazy<Arc<Resolver<GenericConnector<TokioRuntimeProvider>>>> = Lazy::new(|| {
+static RESOLVER: Lazy<Arc<Resolver<TokioRuntimeProvider>>> = Lazy::new(|| {
     let (config, options) = resolver_config();
-    let builder = TokioResolver::builder_with_config(config, TokioConnectionProvider::default())
+    let builder = TokioResolver::builder_with_config(config, TokioRuntimeProvider::new())
         .with_options(options);
-    Arc::new(builder.build())
+    Arc::new(builder.build().expect("build default dns resolver"))
 });
 
 #[cfg(feature = "dns-resolver")]
@@ -252,7 +244,7 @@ impl RuntimeProvider for RuntimeDnsIoProvider {
 }
 
 #[cfg(feature = "dns-resolver")]
-type ContextualResolver = Resolver<GenericConnector<RuntimeDnsIoProvider>>;
+type ContextualResolver = Resolver<RuntimeDnsIoProvider>;
 
 #[derive(Debug, Default)]
 pub(crate) struct RuntimeDnsResolver {
@@ -270,10 +262,11 @@ impl RuntimeDnsResolver {
     #[cfg(feature = "dns-resolver")]
     fn contextual_resolver(context: RuntimeDnsIoContext) -> ContextualResolver {
         let (config, options) = resolver_config();
-        let provider = GenericConnector::new(RuntimeDnsIoProvider::new(context));
+        let provider = RuntimeDnsIoProvider::new(context);
         Resolver::builder_with_config(config, provider)
             .with_options(options)
             .build()
+            .expect("build contextual dns resolver")
     }
 
     #[cfg(feature = "dns-resolver")]
@@ -399,11 +392,15 @@ impl DnsRecordResolver for RuntimeDnsResolver {
             .await
             .with_context(|| format!("txt_lookup failed, domain_name: {}", query.host))?;
         let record = response
+            .answers()
             .iter()
-            .next()
+            .find_map(|record| match &record.data {
+                RData::TXT(txt) => Some(txt),
+                _ => None,
+            })
             .with_context(|| format!("no txt record found, domain_name: {}", query.host))?;
         let data = record
-            .txt_data()
+            .txt_data
             .first()
             .with_context(|| format!("empty txt record, domain_name: {}", query.host))?;
         Ok(String::from_utf8_lossy(data).into_owned())
@@ -419,12 +416,16 @@ impl DnsRecordResolver for RuntimeDnsResolver {
                 .await?
         };
         Ok(response
+            .answers()
             .iter()
-            .map(|record| DnsSrvRecord {
-                priority: record.priority(),
-                weight: record.weight(),
-                port: record.port(),
-                target: record.target().to_utf8(),
+            .filter_map(|record| match &record.data {
+                RData::SRV(srv) => Some(DnsSrvRecord {
+                    priority: srv.priority,
+                    weight: srv.weight,
+                    port: srv.port,
+                    target: srv.target.to_utf8(),
+                }),
+                _ => None,
             })
             .collect())
     }
@@ -451,11 +452,15 @@ async fn resolve_txt_record(domain_name: &str) -> Result<String, Error> {
         .with_context(|| format!("txt_lookup failed, domain_name: {}", domain_name))?;
 
     let txt_record = response
+        .answers()
         .iter()
-        .next()
+        .find_map(|record| match &record.data {
+            RData::TXT(txt) => Some(txt),
+            _ => None,
+        })
         .with_context(|| format!("no txt record found, domain_name: {}", domain_name))?;
 
-    let txt_data = String::from_utf8_lossy(&txt_record.txt_data()[0]);
+    let txt_data = String::from_utf8_lossy(&txt_record.txt_data[0]);
     tracing::info!(?txt_data, ?domain_name, "get txt record");
 
     Ok(txt_data.to_string())

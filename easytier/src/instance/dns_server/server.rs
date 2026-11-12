@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use hickory_proto::rr;
-use hickory_proto::rr::LowerName;
-use hickory_resolver::config::ResolverOpts;
-use hickory_resolver::name_server::TokioConnectionProvider;
-use hickory_resolver::system_conf::read_system_conf;
+use hickory_proto_025::rr;
+use hickory_proto_025::rr::LowerName;
+use hickory_resolver_025::config::ResolverOpts;
+use hickory_resolver_025::name_server::TokioConnectionProvider;
+use hickory_resolver_025::system_conf::read_system_conf;
 use hickory_server::ServerFuture;
 use hickory_server::authority::{AuthorityObject, Catalog, ZoneType};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
@@ -210,9 +210,9 @@ mod tests {
     };
     use anyhow::Result;
     use hickory_client::client::{Client, ClientHandle};
-    use hickory_proto::rr;
-    use hickory_proto::runtime::TokioRuntimeProvider;
-    use hickory_proto::udp::UdpClientStream;
+    use hickory_proto_025::rr;
+    use hickory_proto_025::runtime::TokioRuntimeProvider;
+    use hickory_proto_025::udp::UdpClientStream;
     use maplit::hashmap;
     use std::time::Duration;
 
