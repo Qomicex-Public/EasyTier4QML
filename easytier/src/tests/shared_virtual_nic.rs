@@ -787,7 +787,7 @@ async fn wait_shared_magic_dns_record(
     expected_source: &str,
     expected_ip: &str,
 ) {
-    use hickory_proto::{
+    use hickory_proto_025::{
         op::{Message, MessageType, Query, ResponseCode},
         rr::{RData, RecordType},
     };

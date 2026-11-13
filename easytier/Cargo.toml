@@ -210,14 +210,20 @@ service-manager = { git = "https://github.com/EasyTier/service-manager-rs.git", 
 kcp-sys = { git = "https://github.com/EasyTier/kcp-sys", rev = "268533568d734ae89dc89603078da3ca522effe1", optional = true }
 
 # for dns connector
-hickory-resolver = { version = "0.25.2", optional = true }
-hickory-proto = { version = "0.25.2", optional = true }
+# 0.26 把 runtime/xfer 从 proto 挪到 hickory-net；0.25 线的 DNSSEC 公告均无 0.25 补丁版本。
+hickory-resolver = { version = "0.26.3", optional = true }
+hickory-proto = { version = "0.26.3", optional = true }
+hickory-net = { version = "0.26.3", optional = true }
 
 # for magic dns
+# hickory-client 在 crates.io 上最高只有 0.25.2（0.26 线没有 client crate），
+# magic-dns 这条路径只能继续用 0.25，故单独 aliase 一份与上面的 0.26 并存。
 hickory-client = { version = "0.25.2", optional = true }
 hickory-server = { version = "0.25.2", features = [
     "resolver",
 ], optional = true }
+hickory-proto-025 = { package = "hickory-proto", version = "0.25.2", optional = true }
+hickory-resolver-025 = { package = "hickory-resolver", version = "0.25.2", optional = true }
 
 bon.workspace = true
 derive_builder = { version = "0.20.2", optional = true }
@@ -397,13 +403,15 @@ jemalloc-prof = [
 tracing = ["tokio/tracing", "dep:console-subscriber", "dep:tracing-subscriber"]
 tracing-log = ["tracing/log", "easytier-core/tracing-log"]
 logging = []
-dns-resolver = ["dep:hickory-proto", "dep:hickory-resolver"]
+dns-resolver = ["dep:hickory-proto", "dep:hickory-resolver", "dep:hickory-net"]
 magic-dns = [
     "dep:derive_builder",
     "dep:humantime-serde",
     "dns-resolver",
     "dep:hickory-client",
     "dep:hickory-server",
+    "dep:hickory-proto-025",
+    "dep:hickory-resolver-025",
     "easytier-core/proxy-packet",
     "easytier-proto/magic-dns",
 ]

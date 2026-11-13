@@ -43,8 +43,8 @@ use easytier_core::gateway::magic_dns::{
     MagicDnsRoute,
 };
 use easytier_core::instance::CorePacketPlane;
-use hickory_proto::rr::LowerName;
-use hickory_proto::serialize::binary::{BinDecodable, BinEncoder};
+use hickory_proto_025::rr::LowerName;
+use hickory_proto_025::serialize::binary::{BinDecodable, BinEncoder};
 use hickory_server::authority::{MessageRequest, MessageResponse};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use std::sync::Mutex;
@@ -237,8 +237,8 @@ struct ResponseWrapper {
     response: Arc<Mutex<Vec<u8>>>,
 }
 
-trait RecordIter<'a>: Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a {}
-impl<'a, T> RecordIter<'a> for T where T: Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a {}
+trait RecordIter<'a>: Iterator<Item = &'a hickory_proto_025::rr::Record> + Send + 'a {}
+impl<'a, T> RecordIter<'a> for T where T: Iterator<Item = &'a hickory_proto_025::rr::Record> + Send + 'a {}
 
 #[async_trait::async_trait]
 impl ResponseHandler for ResponseWrapper {
@@ -264,7 +264,7 @@ impl ResponseHandler for ResponseWrapper {
         let max_size = if let Some(edns) = response.get_edns() {
             edns.max_payload()
         } else {
-            hickory_proto::udp::MAX_RECEIVE_BUFFER_SIZE as u16
+            hickory_proto_025::udp::MAX_RECEIVE_BUFFER_SIZE as u16
         };
 
         encoder.set_max_size(max_size);
@@ -279,7 +279,7 @@ impl MagicDnsServerInstanceData {
         let request = Request::new(
             MessageRequest::from_bytes(&query.payload).ok()?,
             query.source,
-            hickory_proto::xfer::Protocol::Udp,
+            hickory_proto_025::xfer::Protocol::Udp,
         );
         let response = Arc::new(Mutex::new(Vec::with_capacity(512)));
 

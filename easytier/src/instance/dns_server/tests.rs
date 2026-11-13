@@ -10,9 +10,9 @@ use easytier_core::{
     process_runtime::CoreProcessRuntime,
 };
 use hickory_client::client::{Client, ClientHandle as _};
-use hickory_proto::rr;
-use hickory_proto::runtime::TokioRuntimeProvider;
-use hickory_proto::udp::UdpClientStream;
+use hickory_proto_025::rr;
+use hickory_proto_025::runtime::TokioRuntimeProvider;
+use hickory_proto_025::udp::UdpClientStream;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
