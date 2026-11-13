@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{RwLock, RwLockReadGuard};
 
-use crate::common::dns::get_default_resolver_config;
+use crate::common::dns::DEFAULT_DNS_SERVERS;
 
 use super::config::{GeneralConfig, Record, RunConfig};
 
@@ -84,8 +84,16 @@ impl Server {
         }
 
         // use forwarder authority for the root zone
-        let system_conf =
-            read_system_conf().unwrap_or((get_default_resolver_config(), ResolverOpts::default()));
+        let system_conf = read_system_conf().unwrap_or_else(|_| {
+            let mut config = hickory_resolver_025::config::ResolverConfig::new();
+            for ip in DEFAULT_DNS_SERVERS {
+                config.add_name_server(hickory_resolver_025::config::NameServerConfig::new(
+                    format!("{ip}:53").parse().expect("default dns server addr"),
+                    hickory_proto_025::xfer::Protocol::Udp,
+                ));
+            }
+            (config, ResolverOpts::default())
+        });
         let forward_config = ForwardConfig {
             name_servers: system_conf
                 .0

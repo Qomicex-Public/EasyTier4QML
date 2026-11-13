@@ -34,12 +34,18 @@ use crate::{
 #[cfg(feature = "dns-resolver")]
 use easytier_core::socket::{NetNamespace, tcp::TcpBindOptions, udp::UdpBindOptions};
 
+/// 默认上游 DNS。dns-resolver（hickory 0.26）与 magic-dns（hickory 0.25）
+/// 各按自己的版本构造配置，但服务器列表共用这一份。
+pub const DEFAULT_DNS_SERVERS: &[&str] = &["223.5.5.5", "180.184.1.1"];
+
 #[cfg(feature = "dns-resolver")]
 pub fn get_default_resolver_config() -> ResolverConfig {
-    ResolverConfig::from_name_servers(vec![
-        NameServerConfig::udp("223.5.5.5".parse().unwrap()),
-        NameServerConfig::udp("180.184.1.1".parse().unwrap()),
-    ])
+    ResolverConfig::from_name_servers(
+        DEFAULT_DNS_SERVERS
+            .iter()
+            .map(|ip| NameServerConfig::udp(ip.parse().expect("default dns server ip")))
+            .collect(),
+    )
 }
 
 #[cfg(feature = "dns-resolver")]
